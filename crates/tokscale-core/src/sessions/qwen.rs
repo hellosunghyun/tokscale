@@ -424,6 +424,56 @@ not valid json at all
     }
 
     #[test]
+    fn test_parse_qwen_clamps_thoughts_above_candidates() {
+        // The total says the thoughts sit inside the candidates, but the
+        // reported thoughts exceed them. Only the candidates can be reasoning,
+        // so the breakdown still sums to the recorded total.
+        let content = r#"{"type": "assistant", "model": "qwen3.5-plus", "timestamp": "2026-02-23T14:24:56.857Z", "sessionId": "session1", "usageMetadata": {"promptTokenCount": 1000, "candidatesTokenCount": 100, "totalTokenCount": 1100, "cachedContentTokenCount": 0, "thoughtsTokenCount": 150}}"#;
+        let file = create_test_file(content);
+
+        let messages = parse_qwen_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 1000);
+        assert_eq!(messages[0].tokens.output, 0);
+        assert_eq!(messages[0].tokens.reasoning, 100);
+        assert_eq!(messages[0].tokens.total(), 1100);
+    }
+
+    #[test]
+    fn test_parse_qwen_keeps_split_when_total_matches_neither_shape() {
+        // prompt + candidates + 7 is neither the OpenAI-compatible shape
+        // (prompt + candidates) nor the Gemini shape (+ thoughts), so the
+        // thoughts stay a separate bucket.
+        let content = r#"{"type": "assistant", "model": "qwen3.5-plus", "timestamp": "2026-02-23T14:24:56.857Z", "sessionId": "session1", "usageMetadata": {"promptTokenCount": 1000, "candidatesTokenCount": 300, "totalTokenCount": 1307, "cachedContentTokenCount": 0, "thoughtsTokenCount": 120}}"#;
+        let file = create_test_file(content);
+
+        let messages = parse_qwen_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 1000);
+        assert_eq!(messages[0].tokens.output, 300);
+        assert_eq!(messages[0].tokens.reasoning, 120);
+    }
+
+    #[test]
+    fn test_parse_qwen_keeps_fully_cached_prompt() {
+        // A fully cached prompt leaves no uncached input. With no output either,
+        // the cache reads are the only usage, so the record must not be
+        // skipped as a zero-token entry.
+        let content = r#"{"type": "assistant", "model": "qwen3.5-plus", "timestamp": "2026-02-23T14:24:56.857Z", "sessionId": "session1", "usageMetadata": {"promptTokenCount": 5000, "candidatesTokenCount": 0, "totalTokenCount": 5000, "cachedContentTokenCount": 5000, "thoughtsTokenCount": 0}}"#;
+        let file = create_test_file(content);
+
+        let messages = parse_qwen_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 0);
+        assert_eq!(messages[0].tokens.cache_read, 5000);
+        assert_eq!(messages[0].tokens.output, 0);
+        assert_eq!(messages[0].tokens.total(), 5000);
+    }
+
+    #[test]
     fn test_parse_qwen_unknown_model_fallback() {
         let content = r#"{"type": "assistant", "timestamp": "2026-02-23T14:24:56.857Z", "sessionId": "session1", "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 200, "thoughtsTokenCount": 10, "cachedContentTokenCount": 5}}"#;
         let file = create_test_file(content);
