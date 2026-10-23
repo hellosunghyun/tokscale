@@ -360,6 +360,11 @@ fn timing_matches(message: &UnifiedMessage, row: &IndexedRow, late_skew_ms: i64)
         } else {
             // An unconfirmed `token_usage_record` is timestamped when the response
             // lands, so its time anchors on the request's end, not its start.
+            // Its lookback covers only MAX_RESPONSE_DURATION_MS of response,
+            // so a longer row is out of contract even when the scan reaches it.
+            if row.duration_ms > MAX_RESPONSE_DURATION_MS {
+                return false;
+            }
             message.timestamp
         };
     (-(MAX_END_SKEW_MS as i64)..=late_skew_ms).contains(&message_end.saturating_sub(row_end))
@@ -1196,6 +1201,12 @@ mod tests {
     fn start_less_record_past_the_late_window_is_rejected() {
         assert_eq!(start_less_record_on_row(ROW_DURATION, 30_000), 1);
         assert_eq!(start_less_record_on_row(ROW_DURATION, 30_001), 0);
+    }
+
+    #[test]
+    fn start_less_record_rejects_rows_longer_than_the_response_bound() {
+        assert_eq!(start_less_record_on_row(MAX_RESPONSE_DURATION_MS, 1_000), 1);
+        assert_eq!(start_less_record_on_row(610_000, 1_000), 0);
     }
 
     #[test]
