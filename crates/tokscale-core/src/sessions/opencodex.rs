@@ -1172,6 +1172,32 @@ mod tests {
         assert_eq!(messages[1].model_id, OTHER_SERVED_MODEL);
     }
 
+    fn start_less_record_on_row(row_duration_ms: i64, late_ms: i64) -> usize {
+        let home = TempDir::new().unwrap();
+        let mut value = row(200, 200, Some(usage()));
+        value["durationMs"] = json!(row_duration_ms);
+        value["attempts"][0]["durationMs"] = json!(row_duration_ms);
+        write_ledger(home.path(), &[value], false);
+        let mut message = codex_message();
+        message.timestamp = START + ROW_START_OFFSET + row_duration_ms + late_ms;
+        message.duration_ms = None;
+        let mut messages = vec![message];
+        attribute_codex_messages(home.path().to_str().unwrap(), false, &mut messages)
+    }
+
+    #[test]
+    fn late_start_less_record_finds_a_long_row() {
+        // The row starts 615s before the record: outside the strict lookback
+        // (2s + 600s), inside the late one (30s + 600s).
+        assert_eq!(start_less_record_on_row(590_000, 25_000), 1);
+    }
+
+    #[test]
+    fn start_less_record_past_the_late_window_is_rejected() {
+        assert_eq!(start_less_record_on_row(ROW_DURATION, 30_000), 1);
+        assert_eq!(start_less_record_on_row(ROW_DURATION, 30_001), 0);
+    }
+
     #[test]
     fn multiple_candidate_requests_fail_closed_even_for_the_same_target() {
         let home = TempDir::new().unwrap();
