@@ -1894,7 +1894,12 @@ fn parser_version(client: ClientId) -> u32 {
         // parsed session, model, and timestamp joins that event's snapshot
         // group instead of being counted beside it. Cached v4 entries of such
         // mixed files would keep serving both copies.
-        ClientId::Cursor => 5,
+        // v5->v6: the cache keeps every accepted row with its event key, and
+        // the Cursor lane performs that same collapse while building a
+        // generation-1-versus-2 recount proof. A warm pre-v6 entry already
+        // holds only survivors and cannot prove the snapshots generation 2
+        // dropped.
+        ClientId::Cursor => 6,
         // Initial Reasonix implementation. The fingerprint samples the
         // append-only stats JSONL source so appended records are reparsed.
         // v1->v2: strip a leading BOM and recover records containing
@@ -8479,8 +8484,8 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_parser_version_invalidates_incorrect_token_and_cost_rows() {
-        assert_eq!(parser_version(ClientId::Cursor), 5);
+    fn test_cursor_parser_version_retains_rows_needed_for_recount_proofs() {
+        assert_eq!(parser_version(ClientId::Cursor), 6);
     }
 
     #[test]

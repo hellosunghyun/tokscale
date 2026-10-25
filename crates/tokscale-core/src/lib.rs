@@ -737,14 +737,37 @@ pub struct RecountProofCell {
 
 impl RecountProofCell {
     fn add(&mut self, message: &UnifiedMessage) {
-        self.tokens.input += message.tokens.input.max(0);
-        self.tokens.output += message.tokens.output.max(0);
-        self.tokens.cache_read += message.tokens.cache_read.max(0);
-        self.tokens.cache_write += message.tokens.cache_write.max(0);
-        self.tokens.cache_write_1h += message.tokens.cache_write_1h.max(0);
-        self.tokens.reasoning += message.tokens.reasoning.max(0);
-        self.cost += message.cost.max(0.0);
-        self.messages += message.message_count.max(0);
+        self.tokens.input = self
+            .tokens
+            .input
+            .saturating_add(message.tokens.input.max(0));
+        self.tokens.output = self
+            .tokens
+            .output
+            .saturating_add(message.tokens.output.max(0));
+        self.tokens.cache_read = self
+            .tokens
+            .cache_read
+            .saturating_add(message.tokens.cache_read.max(0));
+        self.tokens.cache_write = self
+            .tokens
+            .cache_write
+            .saturating_add(message.tokens.cache_write.max(0));
+        self.tokens.cache_write_1h = self
+            .tokens
+            .cache_write_1h
+            .saturating_add(message.tokens.cache_write_1h.max(0));
+        self.tokens.reasoning = self
+            .tokens
+            .reasoning
+            .saturating_add(message.tokens.reasoning.max(0));
+        let cost = if message.cost.is_finite() {
+            message.cost.max(0.0)
+        } else {
+            0.0
+        };
+        self.cost = (self.cost + cost).min(f64::MAX);
+        self.messages = self.messages.saturating_add(message.message_count.max(0));
     }
 }
 
@@ -839,10 +862,10 @@ pub struct UnpricedSubmissionUsage {
 /// regardless of `since`/`until`/`year`, and the scan scope names them in
 /// `fullHistoryClients`.
 ///
-/// Devin CLI is in the set since its generation-2 registration: without
-/// full-history authority its submissions freeze, and its recount proof only
-/// rides on a snapshot declared complete. A database that partly failed to
-/// read is handled after the scan, when `source_reads` withholds the
+/// Devin CLI and Cursor are in the set since their generation-2 registrations:
+/// without full-history authority their submissions freeze, and their recount
+/// proofs only ride on snapshots declared complete. A source that partly failed
+/// to read is handled after the scan, when `source_reads` withholds the
 /// declaration from exactly that client.
 pub const FULL_HISTORY_SUBMIT_CLIENTS: &[&str] = &[
     "amp",
@@ -850,6 +873,7 @@ pub const FULL_HISTORY_SUBMIT_CLIENTS: &[&str] = &[
     "antigravity-cli",
     "antigravity-extension",
     "copilot",
+    "cursor",
     "devin-cli",
     "droid",
     "micode",
@@ -1129,8 +1153,9 @@ struct StreamingParseOutcome {
     source_reads: BTreeMap<String, SourceReadSummary>,
 }
 
-/// The day key and model id a message will carry once `flush_message` has
-/// applied the parse tail to it, or `None` when that tail drops the message.
+/// The day key and model id a contribution will carry after `flush_message`
+/// applies the parse tail and the graph fold canonicalizes its model, or `None`
+/// when that tail drops the message.
 ///
 /// A recount proof has to be keyed exactly like the contributions it
 /// accompanies, and those are built after normalization and rebucketing. Rows
@@ -1163,7 +1188,7 @@ fn flushed_message_identity(
         }
         None => message.date.clone(),
     };
-    Some((date, model_id))
+    Some((date, canonical_model_id(&model_id)))
 }
 
 fn parse_all_messages_with_pricing_with_env_strategy(
@@ -3077,6 +3102,8 @@ fn parse_all_messages_streaming<S: MessageSink>(
         SourceCachePolicy::InMemory => message_cache::SourceMessageCache::default(),
     };
     let mut all_messages: Vec<UnifiedMessage> = Vec::new();
+    let mut recount_proofs: BTreeMap<String, ClientRecountProof> = BTreeMap::new();
+    let mut source_reads: BTreeMap<String, SourceReadSummary> = BTreeMap::new();
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
     // Labels the messages of each source file under a `machineLabels` folder.
@@ -3571,15 +3598,65 @@ fn parse_all_messages_streaming<S: MessageSink>(
         }
     }
 
-    parse_cached_lane(
-        &scan_result,
-        &mut source_cache,
-        pricing,
-        &mut all_messages,
-        &machine_labeler,
-        ClientId::Cursor,
-        sessions::cursor::parse_cursor_file,
-    );
+    // Cursor generation 1 counted every accepted cache row. Generation 2
+    // collapses the repeated running snapshots of one usageEventId, per cache
+    // file, and matches a legacy id-less row to an identified event by parsed
+    // (session, model, timestamp). Keep the raw keyed rows in the source cache
+    // so cold and warm scans can build the same proof from the same messages.
+    if include_synthetic || clients.iter().any(|client| client == "cursor") {
+        let cursor_paths = scan_result.get(ClientId::Cursor);
+        let cursor_outcomes: Vec<CachedParseOutcome> = cursor_paths
+            .par_iter()
+            .map(|path| {
+                let mut outcome = load_or_parse_source(
+                    message_cache::CacheIdentity::for_client(ClientId::Cursor),
+                    path,
+                    &source_cache,
+                    pricing,
+                    sessions::cursor::parse_cursor_file,
+                );
+                machine_labeler.label_messages(path, &mut outcome.messages);
+                outcome
+            })
+            .collect();
+        let unreadable = cursor_paths
+            .iter()
+            .filter(|path| !sessions::cursor::cursor_source_is_readable(path))
+            .count();
+        source_reads.insert(
+            ClientId::Cursor.as_str().to_string(),
+            SourceReadSummary {
+                discovered: cursor_paths.len(),
+                unreadable,
+            },
+        );
+
+        let mut cursor_proof = RecountProofBuilder::default();
+        for outcome in cursor_outcomes {
+            let keep = sessions::cursor::cursor_event_snapshot_keep_mask(&outcome.messages);
+            for (message, kept) in outcome.messages.into_iter().zip(keep) {
+                if let Some((date, model_id)) = flushed_message_identity(&message, &flush_context) {
+                    if kept {
+                        cursor_proof.record_kept(&date, &model_id, &message);
+                    } else if sessions::cursor::is_cursor_event_dedup_key(
+                        message.dedup_key.as_deref(),
+                    ) {
+                        cursor_proof.record_duplicate(&date, &model_id, &message);
+                    }
+                }
+                if kept {
+                    all_messages.push(message);
+                }
+            }
+            if let Some(entry) = outcome.cache_entry {
+                source_cache.insert(entry);
+            }
+        }
+        let proof = cursor_proof.finish();
+        if !proof.is_empty() {
+            recount_proofs.insert(ClientId::Cursor.as_str().to_string(), proof);
+        }
+    }
 
     parse_cached_lane_deduped(
         &scan_result,
@@ -4637,8 +4714,6 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // be configured through scanner extra roots, so parse and dedupe all of
     // them instead of silently ignoring non-default databases.
     let mut devin_cli_session_ids: HashSet<String> = HashSet::new();
-    let mut recount_proofs: BTreeMap<String, ClientRecountProof> = BTreeMap::new();
-    let mut source_reads: BTreeMap<String, SourceReadSummary> = BTreeMap::new();
     if include_devin_cli {
         let devin_cli_outcomes: Vec<CachedParseOutcome> = scan_result
             .devin_dbs
@@ -12536,6 +12611,403 @@ mod tests {
         assert!(!retain_for_requested_clients(
             "kilocode", "gpt-5", "openai", &kilo_only
         ));
+    }
+
+    fn write_cursor_recount_fixtures(home: &Path) -> (PathBuf, PathBuf) {
+        let cursor_cache_dir = home.join(".config/tokscale/cursor-cache");
+        std::fs::create_dir_all(&cursor_cache_dir).unwrap();
+        let json_path = cursor_cache_dir.join("usage.json");
+        let csv_path = cursor_cache_dir.join("usage.legacy.csv");
+        let row = |timestamp: i64,
+                   event_id: Option<&str>,
+                   conversation: &str,
+                   model: &str,
+                   input: i64,
+                   cents: f64| {
+            let mut row = serde_json::json!({
+                "timestamp": timestamp.to_string(),
+                "model": model,
+                "chargedCents": cents,
+                "tokenUsage": {
+                    "inputTokens": input,
+                    "outputTokens": 0,
+                    "totalCents": cents,
+                },
+                "conversationId": conversation,
+            });
+            if let Some(event_id) = event_id {
+                row["usageEventId"] = serde_json::json!(event_id);
+            }
+            row
+        };
+        let timestamp = 1_792_841_120_156_i64;
+        let json = serde_json::json!({
+            "usageEventsDisplay": [
+                row(timestamp, Some("event-a"), "conversation-a", "gpt-5", 100, 100.0),
+                // Matches event-a by parsed (session, model, timestamp) and loses.
+                row(timestamp, None, "conversation-a", "gpt-5", 50, 50.0),
+                row(timestamp + 1, Some("event-b"), "conversation-a", "gpt-5", 200, 200.0),
+                // No identified fallback match: generation 2 keeps it independently.
+                row(timestamp + 2, None, "conversation-unmatched", "gpt-5", 30, 30.0),
+                row(
+                    timestamp + 3,
+                    Some("event-c"),
+                    "conversation-c",
+                    "Claude-3.7-Sonnet-20250219",
+                    40,
+                    40.0,
+                ),
+                // Matches event-c and wins because its token total is larger.
+                row(
+                    timestamp + 3,
+                    None,
+                    "conversation-c",
+                    "Claude-3.7-Sonnet-20250219",
+                    60,
+                    60.0,
+                ),
+            ]
+        });
+        std::fs::write(&json_path, serde_json::to_vec(&json).unwrap()).unwrap();
+        std::fs::write(
+            &csv_path,
+            concat!(
+                "Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost\n",
+                "\"2026-10-24T12:00:00.000Z\",\"On-Demand\",\"legacy-cursor-model\",\"No\",\"7\",\"11\",\"13\",\"17\",\"48\",\"$0.12\"",
+            ),
+        )
+        .unwrap();
+        (json_path, csv_path)
+    }
+
+    fn cursor_proof_cells(
+        messages: &[UnifiedMessage],
+    ) -> std::collections::BTreeMap<(String, String), super::RecountProofCell> {
+        let mut cells = std::collections::BTreeMap::new();
+        for message in messages {
+            cells
+                .entry((
+                    message.date.clone(),
+                    super::canonical_model_id(&message.model_id),
+                ))
+                .or_insert_with(super::RecountProofCell::default)
+                .add(message);
+        }
+        cells
+    }
+
+    #[test]
+    fn recount_proof_cells_saturate_extreme_cursor_rows() {
+        let mut message = UnifiedMessage::new(
+            "cursor",
+            "gpt-5",
+            "openai",
+            "session",
+            1_792_841_120_156,
+            TokenBreakdown {
+                input: i64::MAX,
+                output: i64::MAX,
+                cache_read: i64::MAX,
+                cache_write: i64::MAX,
+                cache_write_1h: i64::MAX,
+                reasoning: i64::MAX,
+            },
+            f64::MAX,
+        );
+        message.message_count = i32::MAX;
+        let mut cell = super::RecountProofCell::default();
+
+        cell.add(&message);
+        cell.add(&message);
+
+        assert_eq!(cell.tokens.input, i64::MAX);
+        assert_eq!(cell.tokens.output, i64::MAX);
+        assert_eq!(cell.tokens.cache_read, i64::MAX);
+        assert_eq!(cell.tokens.cache_write, i64::MAX);
+        assert_eq!(cell.tokens.cache_write_1h, i64::MAX);
+        assert_eq!(cell.tokens.reasoning, i64::MAX);
+        assert_eq!(cell.messages, i32::MAX);
+        assert_eq!(cell.cost, f64::MAX);
+        assert!(cell.cost.is_finite());
+    }
+
+    #[test]
+    fn cursor_cached_lane_keeps_parser_v4_messages_and_proves_every_v1_row() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let (json_path, csv_path) = write_cursor_recount_fixtures(source_home.path());
+        let mut previous_rows = sessions::cursor::parse_cursor_file(&json_path);
+        previous_rows.extend(sessions::cursor::parse_cursor_file(&csv_path));
+        let mut expected = sessions::cursor::parse_cursor_file_deduped(&json_path);
+        expected.extend(sessions::cursor::parse_cursor_file_deduped(&csv_path));
+
+        assert_eq!(previous_rows.len(), 7, "generation 1 counts every row");
+        assert_eq!(
+            expected.len(),
+            5,
+            "generation 2 keeps one snapshot per event"
+        );
+
+        let mut messages = Vec::new();
+        let outcome = super::parse_all_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["cursor".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            SourceCachePolicy::InMemory,
+            &mut messages,
+        );
+
+        assert_eq!(
+            messages, expected,
+            "the dedicated lane must preserve parser-v4 reports"
+        );
+        let proof = outcome.recount_proofs.get("cursor").expect("cursor proof");
+        let previous = cursor_proof_cells(&previous_rows);
+        let corrected = cursor_proof_cells(&expected);
+        for ((date, model), cell) in &previous {
+            assert_eq!(
+                &proof[date][model].previous, cell,
+                "previous {date}/{model}"
+            );
+        }
+        for ((date, model), cell) in &corrected {
+            assert_eq!(
+                &proof[date][model].corrected, cell,
+                "corrected {date}/{model}"
+            );
+        }
+
+        let date = &messages[0].date;
+        let gpt = &proof[date]["gpt-5"];
+        assert_eq!(gpt.previous.tokens.input, 380);
+        assert_eq!(gpt.corrected.tokens.input, 330);
+        assert_eq!(gpt.previous.messages, 4);
+        assert_eq!(gpt.corrected.messages, 3);
+        let claude = &proof[date]["claude-3-7-sonnet"];
+        assert_eq!(claude.previous.tokens.input, 100);
+        assert_eq!(claude.corrected.tokens.input, 60);
+        assert_eq!(claude.previous.messages, 2);
+        assert_eq!(claude.corrected.messages, 1);
+        let legacy = &proof[date]["legacy-cursor-model"];
+        assert_eq!(legacy.previous, legacy.corrected);
+        assert_eq!(legacy.corrected.tokens.input, 11);
+        assert_eq!(legacy.corrected.tokens.cache_write, 7);
+        assert_eq!(legacy.corrected.tokens.cache_read, 13);
+        assert_eq!(legacy.corrected.tokens.output, 17);
+        assert_eq!(outcome.source_reads["cursor"].discovered, 2);
+        assert_eq!(outcome.source_reads["cursor"].unreadable, 0);
+    }
+
+    #[test]
+    fn cursor_recount_collapse_is_per_file_even_when_event_ids_repeat() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cursor_cache_dir = source_home.path().join(".config/tokscale/cursor-cache");
+        std::fs::create_dir_all(&cursor_cache_dir).unwrap();
+        for (name, first, second) in [("usage.json", 10, 20), ("usage.account.json", 30, 40)] {
+            let json = serde_json::json!({
+                "usageEventsDisplay": [
+                    {
+                        "timestamp": "1792841120156",
+                        "model": "gpt-5",
+                        "usageEventId": "same-id-in-two-account-files",
+                        "chargedCents": first,
+                        "tokenUsage": { "inputTokens": first, "totalCents": first },
+                        "conversationId": "same-conversation",
+                    },
+                    {
+                        "timestamp": "1792841120156",
+                        "model": "gpt-5",
+                        "usageEventId": "same-id-in-two-account-files",
+                        "chargedCents": second,
+                        "tokenUsage": { "inputTokens": second, "totalCents": second },
+                        "conversationId": "same-conversation",
+                    },
+                ]
+            });
+            std::fs::write(
+                cursor_cache_dir.join(name),
+                serde_json::to_vec(&json).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let mut messages = Vec::new();
+        let outcome = super::parse_all_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["cursor".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            SourceCachePolicy::InMemory,
+            &mut messages,
+        );
+
+        let mut kept_inputs: Vec<_> = messages
+            .iter()
+            .map(|message| message.tokens.input)
+            .collect();
+        kept_inputs.sort_unstable();
+        assert_eq!(kept_inputs, vec![20, 40]);
+        let date = &messages[0].date;
+        let entry = &outcome.recount_proofs["cursor"][date]["gpt-5"];
+        assert_eq!(entry.previous.tokens.input, 100);
+        assert_eq!(entry.corrected.tokens.input, 60);
+        assert_eq!(entry.previous.messages, 4);
+        assert_eq!(entry.corrected.messages, 2);
+    }
+
+    #[test]
+    fn cursor_snapshot_winner_uses_raw_cost_before_local_pricing() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cursor_cache_dir = source_home.path().join(".config/tokscale/cursor-cache");
+        std::fs::create_dir_all(&cursor_cache_dir).unwrap();
+        let json = serde_json::json!({
+            "usageEventsDisplay": [
+                {
+                    "timestamp": "1792841120156",
+                    "model": "gpt-5",
+                    "usageEventId": "equal-token-event",
+                    "tokenUsage": { "inputTokens": 100, "outputTokens": 0 },
+                    "conversationId": "conversation",
+                },
+                {
+                    "timestamp": "1792841120156",
+                    "model": "gpt-5",
+                    "usageEventId": "equal-token-event",
+                    "tokenUsage": { "inputTokens": 0, "outputTokens": 100 },
+                    "conversationId": "conversation",
+                },
+            ]
+        });
+        std::fs::write(
+            cursor_cache_dir.join("usage.json"),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-5".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.01),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+        let mut messages = Vec::new();
+        super::parse_all_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["cursor".to_string()],
+            Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+            SourceCachePolicy::InMemory,
+            &mut messages,
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 100);
+        assert_eq!(messages[0].tokens.output, 0);
+        assert_eq!(messages[0].cost_source, sessions::CostSource::Estimated);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cursor_recount_proof_and_messages_match_on_cold_and_warm_cache_hits() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let (json_path, _) = write_cursor_recount_fixtures(source_home.path());
+        let _parse_counter =
+            sessions::cursor::register_parse_cursor_file_counter(source_home.path());
+
+        let mut cold_messages = Vec::new();
+        let cold = super::parse_all_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["cursor".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            SourceCachePolicy::Persistent,
+            &mut cold_messages,
+        );
+        assert_eq!(
+            sessions::cursor::parse_cursor_file_call_count(source_home.path()),
+            2,
+            "the cold scan parses both JSON and legacy CSV sources",
+        );
+        let persisted = message_cache::SourceMessageCache::load();
+        let raw_cached = persisted
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::Cursor),
+                &json_path,
+            )
+            .expect("raw Cursor rows cached");
+        assert_eq!(
+            raw_cached.messages.len(),
+            6,
+            "the cache must retain snapshots the lane drops",
+        );
+
+        let mut warm_messages = Vec::new();
+        let warm = super::parse_all_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["cursor".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            SourceCachePolicy::Persistent,
+            &mut warm_messages,
+        );
+
+        assert_eq!(warm_messages, cold_messages);
+        assert_eq!(warm.recount_proofs, cold.recount_proofs);
+        assert_eq!(warm.source_reads, cold.source_reads);
+        assert_eq!(
+            sessions::cursor::parse_cursor_file_call_count(source_home.path()),
+            2,
+            "a warm cache hit must not call the row parser again",
+        );
+    }
+
+    #[test]
+    fn cursor_read_probe_rejects_a_source_the_parser_silently_returns_as_empty() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        write_cursor_recount_fixtures(source_home.path());
+        let broken_path = source_home
+            .path()
+            .join(".config/tokscale/cursor-cache/usage.broken.json");
+        std::fs::write(&broken_path, r#"{"usageEventsDisplay":"not-an-array"}"#).unwrap();
+        assert!(sessions::cursor::parse_cursor_file(&broken_path).is_empty());
+        assert!(!sessions::cursor::cursor_source_is_readable(&broken_path));
+        let broken_csv = source_home
+            .path()
+            .join(".config/tokscale/cursor-cache/usage.malformed.csv");
+        std::fs::write(
+            &broken_csv,
+            "Date,Model
+",
+        )
+        .unwrap();
+        assert!(sessions::cursor::parse_cursor_file(&broken_csv).is_empty());
+        assert!(!sessions::cursor::cursor_source_is_readable(&broken_csv));
+
+        let mut messages = Vec::new();
+        let outcome = super::parse_all_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["cursor".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            SourceCachePolicy::InMemory,
+            &mut messages,
+        );
+
+        assert_eq!(outcome.source_reads["cursor"].discovered, 4);
+        assert_eq!(outcome.source_reads["cursor"].unreadable, 2);
+        assert!(!outcome.source_reads["cursor"].complete());
     }
 
     #[test]

@@ -5272,6 +5272,11 @@ const MICODE_SUBMISSION_PARSER_VERSION: u32 = 2;
 // accepts generation 1 only until a device starts this transition, then
 // freezes every older submit.
 const DEVIN_CLI_SUBMISSION_PARSER_VERSION: u32 = 2;
+/// Cursor generation 2 collapses repeated `usageEventId` snapshots (and the
+/// matching legacy id-less row) once per cache file. The raw rows remain in the
+/// parser cache so the scan can ship the same per-day recount proof used for
+/// Devin CLI; generation 1 stays accepted only until a device transitions.
+const CURSOR_SUBMISSION_PARSER_VERSION: u32 = 2;
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -5322,9 +5327,10 @@ struct TsScanScope {
     retention_floors: Option<std::collections::BTreeMap<String, String>>,
     /// Per-day correction evidence for clients whose declared generation
     /// counts the same history LOWER than the one the receiver may have
-    /// stored (Devin CLI's request_id dedup). A generation number alone only
-    /// proves identity; this proves, per cell, how much the older generation
-    /// over-counted from exactly the rows this snapshot was built from, so
+    /// stored (Devin CLI request dedup and Cursor event-snapshot collapse). A
+    /// generation number alone only proves identity. This proves how much the
+    /// older generation over-counted each cell from the exact rows that built
+    /// this snapshot, so
     /// the receiver subtracts that difference instead of replacing the cell.
     /// Only sent for clients carrying full-history authority.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5364,29 +5370,28 @@ fn incompletely_read_clients(
         .collect()
 }
 
-/// True when the corrected side of every model on a proof day is empty: the
-/// previous generation counted rows there that this generation drops
-/// entirely, so the submission has no contribution to date for the day.
-fn recount_proof_day_is_all_duplicates(
-    models: &std::collections::BTreeMap<String, tokscale_core::RecountProofEntry>,
-) -> bool {
-    models.values().all(|entry| {
-        let tokens = &entry.corrected.tokens;
-        tokens.input == 0
-            && tokens.output == 0
-            && tokens.cache_read == 0
-            && tokens.cache_write == 0
-            && tokens.cache_write_1h == 0
-            && tokens.reasoning == 0
-            && entry.corrected.messages == 0
-    })
+/// True when the corrected side of one proof cell is empty: the previous
+/// generation counted rows that this generation drops entirely, so the
+/// submission has no contribution for this (day, model) cell.
+fn recount_proof_cell_is_all_duplicates(entry: &tokscale_core::RecountProofEntry) -> bool {
+    let tokens = &entry.corrected.tokens;
+    tokens.input == 0
+        && tokens.output == 0
+        && tokens.cache_read == 0
+        && tokens.cache_write == 0
+        && tokens.cache_write_1h == 0
+        && tokens.reasoning == 0
+        && entry.corrected.cost == 0.0
+        && entry.corrected.messages == 0
 }
 
 /// Recount proofs for the clients that carry full-history authority in
-/// `scope`, limited to the days the submission actually dates for them plus
-/// the days whose every row the corrected generation drops: those have no
-/// contribution to date, yet their stored over-count is exactly what the
-/// proof exists to heal.
+/// `scope`, limited to the (day, model) cells the submission actually carries
+/// plus cells whose every row the corrected generation drops. The latter have
+/// no contribution to submit, yet their stored over-count is exactly what the
+/// proof exists to heal. Filtering at model granularity also removes a
+/// tokenless-cost row that submission excluded from a day where another model
+/// still has usage.
 fn submission_recount_proofs(
     graph: &tokscale_core::GraphResultV2,
     scope: &TsScanScope,
@@ -5396,21 +5401,25 @@ fn submission_recount_proofs(
         if !scope.full_history && !scope.full_history_clients.iter().any(|c| c == client) {
             continue;
         }
-        let submitted_dates: std::collections::BTreeSet<&str> = graph
+        let submitted_cells: std::collections::BTreeSet<(&str, &str)> = graph
             .contributions
             .iter()
-            .filter(|day| day.clients.iter().any(|s| &s.client == client))
-            .map(|day| day.date.as_str())
+            .flat_map(|day| {
+                day.clients
+                    .iter()
+                    .filter(|submission| &submission.client == client)
+                    .map(|submission| (day.date.as_str(), submission.model_id.as_str()))
+            })
             .collect();
         let days: std::collections::BTreeMap<_, _> = proof
             .iter()
-            .filter(|(date, models)| {
-                submitted_dates.contains(date.as_str())
-                    || recount_proof_day_is_all_duplicates(models)
-            })
-            .map(|(date, models)| {
-                let models = models
+            .filter_map(|(date, models)| {
+                let models: std::collections::BTreeMap<_, _> = models
                     .iter()
+                    .filter(|(model_id, entry)| {
+                        submitted_cells.contains(&(date.as_str(), model_id.as_str()))
+                            || recount_proof_cell_is_all_duplicates(entry)
+                    })
                     .map(|(model_id, entry)| {
                         (
                             model_id.clone(),
@@ -5421,7 +5430,7 @@ fn submission_recount_proofs(
                         )
                     })
                     .collect();
-                (date.clone(), models)
+                (!models.is_empty()).then_some((date.clone(), models))
             })
             .collect();
         if !days.is_empty() {
@@ -5657,6 +5666,7 @@ fn submit_scan_scope(
             let version = match client.as_str() {
                 "amp" => AMP_SUBMISSION_PARSER_VERSION,
                 "copilot" => COPILOT_SUBMISSION_PARSER_VERSION,
+                "cursor" => CURSOR_SUBMISSION_PARSER_VERSION,
                 "devin-cli" => DEVIN_CLI_SUBMISSION_PARSER_VERSION,
                 "micode" | "micode-desktop" => MICODE_SUBMISSION_PARSER_VERSION,
                 _ => SUBMISSION_PARSER_VERSION,
@@ -10525,17 +10535,25 @@ mod tests {
         assert_eq!(together.full_history_clients, family);
     }
 
-    /// The exemption list mirrors the receiver's snapshot-integrity set, which
-    /// registers devin-cli at generation 2: a bounded submit that filtered it
-    /// would freeze on the receiver and discard the window's usage, and its
-    /// recount proof only rides on a declared-complete snapshot.
+    /// The exemption list mirrors the receiver's snapshot-integrity set. A
+    /// bounded submit that filtered a recounting client would freeze on the
+    /// receiver and discard the window's usage, and its proof only rides on a
+    /// declared-complete snapshot.
     #[test]
-    fn submit_scan_scope_names_devin_cli_complete_on_a_partial_scan() {
-        let clients = vec!["codex".to_string(), "devin-cli".to_string()];
+    fn submit_scan_scope_names_recount_clients_complete_on_a_partial_scan() {
+        let clients = vec![
+            "codex".to_string(),
+            "cursor".to_string(),
+            "devin-cli".to_string(),
+        ];
         let scope = submit_scan_scope(Some(&clients), false, true).expect("scope");
 
         assert!(!scope.full_history);
-        assert_eq!(scope.full_history_clients, vec!["devin-cli".to_string()]);
+        assert_eq!(
+            scope.full_history_clients,
+            vec!["cursor".to_string(), "devin-cli".to_string()]
+        );
+        assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
         assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
     }
 
@@ -10548,18 +10566,23 @@ mod tests {
     fn bounded_scan_withholds_declaration_from_partially_read_exempt_clients() {
         let clients = vec![
             "codex".to_string(),
+            "cursor".to_string(),
             "devin-cli".to_string(),
             "droid".to_string(),
         ];
         let mut scope = submit_scan_scope(Some(&clients), false, true).expect("scope");
         assert_eq!(
             scope.full_history_clients,
-            vec!["devin-cli".to_string(), "droid".to_string()]
+            vec![
+                "cursor".to_string(),
+                "devin-cli".to_string(),
+                "droid".to_string(),
+            ]
         );
 
         let mut reads = std::collections::BTreeMap::new();
         reads.insert(
-            "devin-cli".to_string(),
+            "cursor".to_string(),
             tokscale_core::SourceReadSummary {
                 discovered: 2,
                 unreadable: 1,
@@ -10568,24 +10591,24 @@ mod tests {
         withhold_full_history_for_clients(&mut scope, &incompletely_read_clients(&reads));
 
         assert!(!scope.full_history);
-        assert_eq!(scope.full_history_clients, vec!["droid".to_string()]);
-        // Identity stays declared; only the completeness authority is gone.
-        assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
+        assert_eq!(
+            scope.full_history_clients,
+            vec!["devin-cli".to_string(), "droid".to_string()]
+        );
+        // Identity stays declared; only Cursor's completeness authority is gone.
+        assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
     }
 
-    /// Devin CLI generation 2 deduplicates `message_nodes` rows by request_id,
-    /// which lowers the counted total — a recount, not a re-attribution. The
-    /// server accepts the generation via `SUPPORTED_VERSIONED_PARSERS` and
-    /// heals stored cells from the per-day recount proof this CLI ships
-    /// (`RECOUNT_PROOF_CLIENTS`, both in
-    /// packages/frontend/src/lib/db/parserHighWater.ts). Generation 1
-    /// (pre-request_id dedup) freezes once a device transitions, so only a CLI
-    /// declaring this version can heal the inflated rows.
+    /// Generation 2 lowers both recounting clients: Devin CLI collapses
+    /// request_id copies and Cursor collapses usageEventId snapshots. The
+    /// receiver registers the same submission generation and freezes generation
+    /// 1 only after a device transitions.
     #[test]
-    fn submit_scan_scope_declares_the_devin_cli_generation_the_server_registers() {
-        let clients = vec!["devin-cli".to_string()];
-        let scope = submit_scan_scope(Some(&clients), true, true).expect("devin-cli scope");
+    fn submit_scan_scope_declares_the_recount_generations_the_server_registers() {
+        let clients = vec!["cursor".to_string(), "devin-cli".to_string()];
+        let scope = submit_scan_scope(Some(&clients), true, true).expect("recount scope");
 
+        assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
         assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
         // The desktop surface parses an unrelated ACP stream and is unaffected
         // by the CLI request_id dedup; it keeps the default generation.
@@ -10713,6 +10736,102 @@ mod tests {
         assert!(!scope.full_history);
         assert!(scope.full_history_clients.is_empty());
         assert!(scope.recount_proofs.is_none());
+    }
+
+    #[test]
+    fn cursor_payload_ships_only_snapshot_matching_proof_cells_with_authority() {
+        let mut graph = graph_result_with_contributions(vec![day_with_clients(
+            "2026-10-08",
+            350,
+            vec![client_contribution(
+                "cursor",
+                "gemini-4-argon-medium",
+                "cursor",
+                350,
+                3.5,
+                1,
+            )],
+        )]);
+        let mut proof = tokscale_core::ClientRecountProof::new();
+        proof.entry("2026-10-08".to_string()).or_default().insert(
+            "gemini-4-argon-medium".to_string(),
+            tokscale_core::RecountProofEntry {
+                previous: recount_cell(900, 9.0, 3),
+                corrected: recount_cell(350, 3.5, 1),
+            },
+        );
+        // Submission strips tokenless cost rows after the core proof is built.
+        // Model-granular filtering must not let this absent cell invalidate the
+        // otherwise matching Cursor proof for the day.
+        proof.entry("2026-10-08".to_string()).or_default().insert(
+            "tokenless-model".to_string(),
+            tokscale_core::RecountProofEntry {
+                previous: recount_cell(0, 2.0, 2),
+                corrected: recount_cell(0, 1.0, 1),
+            },
+        );
+        // A genuinely all-duplicate cell has no submitted contribution and is
+        // still required to heal the stored day.
+        proof.entry("2026-10-07".to_string()).or_default().insert(
+            "gemini-4-argon-medium".to_string(),
+            tokscale_core::RecountProofEntry {
+                previous: recount_cell(25, 0.25, 1),
+                corrected: recount_cell(0, 0.0, 0),
+            },
+        );
+        graph.recount_proofs.insert("cursor".to_string(), proof);
+        let clients = vec!["cursor".to_string()];
+
+        let full = to_ts_token_contribution_data(
+            &graph,
+            None,
+            submit_scan_scope(Some(&clients), true, true),
+        );
+        let proofs = full
+            .scan_scope
+            .as_ref()
+            .and_then(|scope| scope.recount_proofs.as_ref())
+            .expect("Cursor proof ships with authority");
+        let cursor = &proofs["cursor"];
+        assert_eq!(
+            cursor["2026-10-08"]["gemini-4-argon-medium"]
+                .previous
+                .tokens
+                .input,
+            900
+        );
+        assert!(!cursor["2026-10-08"].contains_key("tokenless-model"));
+        assert_eq!(
+            cursor["2026-10-07"]["gemini-4-argon-medium"]
+                .corrected
+                .messages,
+            0
+        );
+
+        // A bounded CLI request still carries full-history authority for Cursor:
+        // its rows are exempt from the date filter, so the proof is safe.
+        let bounded = to_ts_token_contribution_data(
+            &graph,
+            None,
+            submit_scan_scope(Some(&clients), false, true),
+        );
+        assert!(bounded
+            .scan_scope
+            .as_ref()
+            .and_then(|scope| scope.recount_proofs.as_ref())
+            .is_some_and(|proofs| proofs.contains_key("cursor")));
+
+        let mut withheld = submit_scan_scope(Some(&clients), true, true).unwrap();
+        withhold_full_history_for_clients(
+            &mut withheld,
+            &["cursor".to_string()].into_iter().collect(),
+        );
+        let withheld = to_ts_token_contribution_data(&graph, None, Some(withheld));
+        assert!(withheld
+            .scan_scope
+            .as_ref()
+            .and_then(|scope| scope.recount_proofs.as_ref())
+            .is_none());
     }
 
     /// `fullHistory` only ever meant "no date filter". A Devin database that

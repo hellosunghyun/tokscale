@@ -4120,7 +4120,7 @@ mod tests {
             serde_json::json!({"usageEventsDisplay":[event]}).to_string(),
         )
         .unwrap();
-        let parsed = tokscale_core::sessions::cursor::parse_cursor_file(&path);
+        let parsed = tokscale_core::sessions::cursor::parse_cursor_file_deduped(&path);
         assert!(parsed.len() <= 1);
         parsed.first().map(|row| row.timestamp)
     }
@@ -4515,7 +4515,7 @@ mod tests {
             serde_json::json!({"usageEventsDisplay":[event]}).to_string(),
         )
         .unwrap();
-        let parsed = tokscale_core::sessions::cursor::parse_cursor_file(&path);
+        let parsed = tokscale_core::sessions::cursor::parse_cursor_file_deduped(&path);
         assert!(parsed.len() <= 1);
         parsed.first().map(|row| {
             [
@@ -4674,7 +4674,7 @@ mod tests {
             serde_json::json!({"usageEventsDisplay":[event]}).to_string(),
         )
         .unwrap();
-        let rows = tokscale_core::sessions::cursor::parse_cursor_file(&path);
+        let rows = tokscale_core::sessions::cursor::parse_cursor_file_deduped(&path);
         assert!(rows.len() <= 1);
         rows.first().map(|row| serde_json::json!({
             "session":row.session_id,"model":row.model_id,"provider":row.provider_id,
@@ -4999,7 +4999,7 @@ mod tests {
                 serde_json::json!({"usageEventsDisplay":[variant]}).to_string(),
             )
             .unwrap();
-            let messages = tokscale_core::sessions::cursor::parse_cursor_file(&parsed_path);
+            let messages = tokscale_core::sessions::cursor::parse_cursor_file_deduped(&parsed_path);
             assert_eq!(messages.len(), 1);
             let tokens = &messages[0].tokens;
             assert_eq!(
@@ -5760,7 +5760,7 @@ mod tests {
                 Some(cursor_cache_owner_hash(secondary_id).as_str()),
                 "cleanup must retain the freshly written secondary; active_fails={active_fails}"
             );
-            let rows = tokscale_core::sessions::cursor::parse_cursor_file(&secondary_path);
+            let rows = tokscale_core::sessions::cursor::parse_cursor_file_deduped(&secondary_path);
             assert_eq!(rows.len(), 1, "secondary history must remain reportable");
             assert_eq!(rows[0].session_id, "secondary-history");
             assert_eq!(rows[0].tokens.input, 10);
@@ -7043,7 +7043,7 @@ mod tests {
             };
             let text = fs::read_to_string(&path)?;
             assert_eq!(cursor_cache_owner(&text).as_deref(), Some(id.as_str()));
-            let messages = tokscale_core::sessions::cursor::parse_cursor_file(&path);
+            let messages = tokscale_core::sessions::cursor::parse_cursor_file_deduped(&path);
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].session_id, *id);
         }
