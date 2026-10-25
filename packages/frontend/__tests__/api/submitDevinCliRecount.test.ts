@@ -654,22 +654,25 @@ describe("POST /api/submit devin-cli recount proof", () => {
 
   it("keeps stored usage from a source the scan could not read", async () => {
     // Two Devin databases fed the stored day: A = 400 tokens of which 50 are
-    // duplicate rows, B = 600. Generation 2 reads A while B fails to open, so
-    // the payload carries 350 for the date. Only A's proven 50 come off.
+    // duplicate rows, B = 600. Generation 2 reads A while B is gone, so the
+    // payload carries 350 for the date and the proof explains only 400 of the
+    // stored 1,000. The receiver keeps no record of past corrections, so it
+    // must not take A's 50 off here: every later submit with this same proof
+    // would take them off again and wear B's 600 down to 350.
     const store = newStore();
     seedDay(store, "2026-10-08", { "devin-cli": devinCell(1_000, 1) });
 
-    await submit(
-      store,
+    const partial = () =>
       submissionBody([
         { date: "2026-10-08", tokens: 350, cost: 0.35, previous: { tokens: 400, cost: 0.4 } },
-      ]),
-    );
-    expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBe(950);
+      ]);
+    for (let replay = 0; replay < 3; replay += 1) {
+      await submit(store, partial());
+      expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBe(1_000);
+    }
 
     // When B is readable again (with 60 duplicates of its own) the proof
-    // covers both databases and the day heals to the truth, without taking
-    // A's duplicates off a second time.
+    // covers both databases and the day heals to the truth.
     await submit(
       store,
       submissionBody([

@@ -1678,8 +1678,9 @@ describe("devin-cli recount proof", () => {
   it("keeps stored usage the proof does not describe", () => {
     // Two local databases fed the stored day (A = 400 with 50 duplicate
     // rows, B = 600). This scan read only A: B contributes to neither side of
-    // the proof, so only A's 50 duplicates come off and B's 600 stay. Replacing
-    // the cell with the 350 the scan reports would delete B outright.
+    // the proof, which explains only 400 of the stored 1,000. Replacing the
+    // cell with the 350 the scan reports would delete B outright, and taking
+    // A's 50 off would be repeated by every later submit of the same proof.
     const stored = devinSnapshot(devinContribution("2026-10-08", 1_000));
     const scan = devinSnapshot(devinContribution("2026-10-08", 350));
     const plan = devinPlan(stored, scan, {
@@ -1690,22 +1691,41 @@ describe("devin-cli recount proof", () => {
 
     expect(plan.mode).toBe("baseline-legacy");
     expect(plan.recountDays).toEqual(["2026-10-08"]);
-    expect(plan.nextState?.days["2026-10-08"]?.tokens).toBe(950);
-    expect(plan.nextState?.aggregate.tokens).toBe(950);
+    expect(plan.nextState?.days["2026-10-08"]?.tokens).toBe(1_000);
+    expect(plan.nextState?.aggregate.tokens).toBe(1_000);
+  });
+
+  it("does not wear unexplained usage down when the same proof is replayed", () => {
+    // Stored 1,000, but the proof's rows account for only 500 of it (100
+    // after dedup). Subtracting the 400 on every submit would give 600, 200,
+    // then 100, removing usage the proof never described.
+    const stored = devinSnapshot(devinContribution("2026-10-08", 1_000));
+    const scan = devinSnapshot(devinContribution("2026-10-08", 100));
+    const partialProof = proof({
+      "2026-10-08": { previous: proofCell(500), corrected: proofCell(100) },
+    });
+    let state = devinPlan(stored, scan, { recountProof: partialProof }).nextState!;
+    expect(state.days["2026-10-08"]?.tokens).toBe(1_000);
+
+    for (let replay = 0; replay < 3; replay += 1) {
+      const plan = devinPlan({}, scan, { state, recountProof: partialProof });
+      expect(plan.mode).toBe("incremental");
+      expect(plan.nextState?.days["2026-10-08"]?.tokens).toBe(1_000);
+      state = plan.nextState!;
+    }
   });
 
   it("heals the rest once the missing source is read again", () => {
-    // Continuing from the A-only scan above (ledger 950): B becomes readable
-    // and carries 60 duplicates of its own. The proof now covers both, and
-    // the subtraction stops at the corrected count, so A's duplicates are not
-    // taken off a second time.
+    // Continuing from the A-only scan above (ledger kept at 1,000): B becomes
+    // readable and carries 60 duplicates of its own. The proof now explains
+    // the whole stored cell, so the day drops to the corrected count.
     const stored = devinSnapshot(devinContribution("2026-10-08", 1_000));
     const first = devinPlan(stored, devinSnapshot(devinContribution("2026-10-08", 350)), {
       recountProof: proof({
         "2026-10-08": { previous: proofCell(400), corrected: proofCell(350) },
       }),
     });
-    expect(first.nextState?.days["2026-10-08"]?.tokens).toBe(950);
+    expect(first.nextState?.days["2026-10-08"]?.tokens).toBe(1_000);
 
     const second = devinPlan({}, devinSnapshot(devinContribution("2026-10-08", 890)), {
       state: first.nextState,

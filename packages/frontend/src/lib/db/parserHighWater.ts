@@ -79,13 +79,15 @@ const SNAPSHOT_LAYOUT_CLIENTS: ReadonlySet<string> = new Set(["droid", "amp"]);
  * These clients therefore ship a per-day recount proof with every
  * full-history snapshot (`scanScope.recountProofs`): for each (day, model)
  * cell, what the previous generation counted from the same rows and what
- * this generation counts from them. The receiver subtracts ONLY that proven
- * over-count from its stored cell, never below the corrected count, and
- * never from usage the proof does not describe. A source that failed to
- * read contributes to neither side of the proof, so its stored usage is left
- * exactly as it was. The subtraction is idempotent and monotone, so it runs
- * on every submit rather than once: a source that comes back later, or cost
- * that could only be priced later, heals on the next complete snapshot.
+ * this generation counts from them. A stored field drops to the corrected
+ * count only when the previous generation's count from those rows accounts
+ * for all of it. A larger stored value holds usage the proof cannot describe
+ * (a source deleted or no longer cached locally), so it is kept exactly as it
+ * is: subtracting the over-count from it would remove that usage again on
+ * every later submit. The correction is a projection, so it runs on every
+ * submit rather than once and changes nothing after the first application: a
+ * source that comes back later, or cost that could only be priced later,
+ * heals on the next complete snapshot that explains the stored cell.
  *
  * A non-fullHistory submit still freezes, so a partial scan never corrects
  * anything, and an empty snapshot keeps the transition pending rather than
@@ -571,10 +573,19 @@ export function partitionRecountProof(
   return { accepted, rejected };
 }
 
-/** Subtract `delta` from `stored`, but never below `floor`. */
-function subtractProven(stored: number, delta: number, floor: number): number {
-  const room = positive(stored - floor);
-  return stored - Math.min(positive(delta), room);
+/**
+ * Correct one stored field from a recount proof: drop it to `corrected` when
+ * `previous` (what the old generation counted from the proof's rows) accounts
+ * for the whole stored value, and keep it otherwise. Never raises a field.
+ */
+function correctProvenField(
+  stored: number,
+  previous: number,
+  corrected: number,
+  tolerance = 0
+): number {
+  if (stored > previous + tolerance) return stored;
+  return Math.min(stored, positive(corrected));
 }
 
 export interface RecountCorrection {
@@ -586,18 +597,22 @@ export interface RecountCorrection {
 /**
  * Apply one day's recount proof to a stored cell.
  *
- * Per model and per field the stored value drops by the proven over-count
- * (`previous - corrected`), but never below the corrected count. The floor is
- * what makes this safe to run on every submit and against any stored cell:
+ * Per model and per field, a stored value that the previous generation's
+ * count from the proof's rows accounts for (`stored <= previous`) drops to the
+ * corrected count; any other stored value is kept. This is what makes it safe
+ * to run on every submit and against any stored cell:
  *
  * - a cell already at the corrected count loses nothing (idempotent);
- * - a cell carrying usage the proof never saw — a database that failed to
- *   open, history deleted locally — keeps all of it, because only the proven
- *   duplicate amount is removed;
+ * - a cell carrying usage the proof never saw — a source deleted or no longer
+ *   cached locally — is kept whole. Subtracting only the proven duplicates
+ *   would be right once, but the receiver keeps no record of a correction it
+ *   already made, so the next submit with the same proof would take them off
+ *   again and wear the unseen usage down to the corrected count;
  * - a cell BELOW the corrected count (new usage not yet credited) is left for
  *   the bounded-growth allocation to raise, never lowered;
  * - a source that becomes readable again, or cost that becomes priceable
- *   later, enlarges the proof and the extra over-count comes off then.
+ *   later, enlarges the proof; once it accounts for the stored cell, the cell
+ *   drops to the corrected count then.
  *
  * Models the proof does not name are untouched; proof models the cell does
  * not hold have nothing to correct.
@@ -616,9 +631,9 @@ export function applyRecountProofToCell(
       model.inputIncludingCacheRead ?? model.input + model.cacheRead
     );
     for (const field of PROOF_TOKEN_FIELDS) {
-      next[field] = subtractProven(
+      next[field] = correctProvenField(
         model[field],
-        entry.previous.tokens[field] - entry.corrected.tokens[field],
+        entry.previous.tokens[field],
         entry.corrected.tokens[field]
       );
       removed.tokens += model[field] - next[field];
@@ -629,17 +644,20 @@ export function applyRecountProofToCell(
         (model.cacheRead - next.cacheRead)
     );
     next.tokens = PROOF_TOKEN_FIELDS.reduce((sum, field) => sum + next[field], 0);
+    // Stored and proof costs are sums of the same per-message prices and can
+    // differ by floating-point noise; that slack still counts as accounted for.
     next.cost = quantizeCost(
-      subtractProven(
+      correctProvenField(
         model.cost,
-        entry.previous.cost - entry.corrected.cost,
-        entry.corrected.cost
+        entry.previous.cost,
+        entry.corrected.cost,
+        PROOF_COST_TOLERANCE
       )
     );
     removed.cost += model.cost - next.cost;
-    next.messages = subtractProven(
+    next.messages = correctProvenField(
       model.messages,
-      entry.previous.messages - entry.corrected.messages,
+      entry.previous.messages,
       entry.corrected.messages
     );
     removed.messages += model.messages - next.messages;
