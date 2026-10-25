@@ -1918,6 +1918,24 @@ describe("devin-cli recount proof", () => {
     expect(applyRecountProofToCell(belowCorrected, proofDay).cell.cost).toBeCloseTo(5, 4);
   });
 
+  it("treats a stored cost within one stored unit above the previous cost as explained", () => {
+    // Stored costs are quantized to 1/10,000 while proof costs are raw sums of
+    // the same prices, so they can differ by noise below one stored unit.
+    const base = devinSnapshot(devinContribution("2026-10-08", 3_000, "swe-2-high", 30))["2026-10-08"];
+    const withCost = (cost: number): ClientBreakdownData => ({
+      ...base,
+      cost,
+      models: { "swe-2-high": { ...base.models["swe-2-high"], cost } },
+    });
+    const proofDay = proof({
+      "2026-10-08": { previous: proofCell(3_000, 30), corrected: proofCell(1_200, 8) },
+    })["2026-10-08"];
+
+    expect(applyRecountProofToCell(withCost(30.00005), proofDay).cell.cost).toBeCloseTo(8, 4);
+    // Beyond that slack the stored cost holds spend the proof does not explain.
+    expect(applyRecountProofToCell(withCost(30.0003), proofDay).cell.cost).toBeCloseTo(30.0003, 4);
+  });
+
   it("keeps generation-1 submissions compatible before the transition", () => {
     const plan = planParserHighWaterSubmission({
       client: "devin-cli",

@@ -645,7 +645,10 @@ export function applyRecountProofToCell(
     );
     next.tokens = PROOF_TOKEN_FIELDS.reduce((sum, field) => sum + next[field], 0);
     // Stored and proof costs are sums of the same per-message prices and can
-    // differ by floating-point noise; that slack still counts as accounted for.
+    // differ by floating-point noise, so a stored cost up to one stored cost
+    // unit above `previous` still counts as accounted for. In that slack the
+    // field drops to the corrected cost, which can remove up to one unit more
+    // than subtracting the proven over-count would.
     next.cost = quantizeCost(
       correctProvenField(
         model.cost,
