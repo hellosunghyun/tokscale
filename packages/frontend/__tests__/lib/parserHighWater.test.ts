@@ -2427,6 +2427,210 @@ describe("devin-cli recount proof", () => {
   });
 });
 
+describe("cursor recount proof rollout", () => {
+  const client = "cursor";
+  const modelId = "gemini-4-argon-medium";
+
+  function cursorContribution(
+    date: string,
+    tokens: number,
+    cost: number,
+    messages: number
+  ) {
+    return {
+      date,
+      clients: [
+        {
+          client,
+          modelId,
+          tokens: {
+            input: tokens,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            reasoning: 0,
+          },
+          cost,
+          messages,
+        },
+      ],
+    };
+  }
+
+  function cursorSnapshot(
+    ...rows: ReturnType<typeof cursorContribution>[]
+  ): Record<string, ClientBreakdownData> {
+    return foldParserClientSnapshot(rows, client);
+  }
+
+  function cursorProofCell(
+    tokens: number,
+    cost: number,
+    messages: number
+  ): RecountProofCell {
+    return {
+      tokens: {
+        input: tokens,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+      },
+      cost,
+      messages,
+    };
+  }
+
+  function cursorProof(
+    previous: RecountProofCell,
+    corrected: RecountProofCell
+  ): ClientRecountProof {
+    return {
+      "2026-10-08": {
+        [modelId]: { previous, corrected },
+      },
+    };
+  }
+
+  function cursorPlan(args: {
+    existing: Record<string, ClientBreakdownData>;
+    incoming: Record<string, ClientBreakdownData>;
+    fullHistory?: boolean;
+    incomingVersion?: number;
+    state?: ParserClientHighWaterState;
+    persistedVersion?: number;
+    recountProof?: ClientRecountProof;
+  }) {
+    return planParserHighWaterSubmission({
+      client,
+      incomingVersion:
+        args.incomingVersion ?? SUPPORTED_VERSIONED_PARSERS.cursor,
+      fullHistory: args.fullHistory ?? true,
+      existingLegacyDays: args.existing,
+      incomingDays: args.incoming,
+      state: args.state,
+      persistedVersion: args.persistedVersion,
+      recountProof: args.recountProof,
+    });
+  }
+
+  const inflated = cursorSnapshot(
+    cursorContribution("2026-10-08", 1_000, 10, 4)
+  );
+  const corrected = cursorSnapshot(
+    cursorContribution("2026-10-08", 400, 4, 1)
+  );
+  const proof = cursorProof(
+    cursorProofCell(1_000, 10, 4),
+    cursorProofCell(400, 4, 1)
+  );
+
+  it("registers generation 2 while accepting generation 1 until transition", () => {
+    expect(SUPPORTED_VERSIONED_PARSERS.cursor).toBe(2);
+
+    const before = cursorPlan({
+      existing: inflated,
+      incoming: inflated,
+      incomingVersion: 1,
+    });
+    expect(before.mode).toBe("status-quo");
+    expect(before.nextState).toBeUndefined();
+
+    const pending = cursorPlan({
+      existing: inflated,
+      incoming: corrected,
+      fullHistory: false,
+      recountProof: proof,
+    }).nextState!;
+    const after = cursorPlan({
+      existing: corrected,
+      incoming: inflated,
+      incomingVersion: 1,
+      state: pending,
+      persistedVersion: 2,
+    });
+    expect(after.mode).toBe("freeze");
+    expect(after.nextState).toBeUndefined();
+  });
+
+  it("lowers an inflated cell from a full-history proof but never below corrected", () => {
+    const exact = cursorPlan({
+      existing: inflated,
+      incoming: corrected,
+      recountProof: proof,
+    });
+    expect(exact.mode).toBe("baseline-legacy");
+    expect(exact.recountDays).toEqual(["2026-10-08"]);
+    expect(exact.nextState?.days["2026-10-08"]?.tokens).toBe(400);
+    expect(exact.nextState?.days["2026-10-08"]?.cost).toBe(4);
+    expect(exact.nextState?.days["2026-10-08"]?.messages).toBe(1);
+
+    const alreadyBelow = cursorPlan({
+      existing: cursorSnapshot(
+        cursorContribution("2026-10-08", 350, 3.5, 1)
+      ),
+      incoming: corrected,
+      recountProof: proof,
+    });
+    expect(alreadyBelow.nextState?.days["2026-10-08"]?.tokens).toBe(400);
+    expect(alreadyBelow.nextState?.days["2026-10-08"]?.cost).toBe(4);
+    expect(alreadyBelow.nextState?.days["2026-10-08"]?.messages).toBe(1);
+  });
+
+  it("rejects a proof whose corrected side does not match the submitted cell", () => {
+    const mismatched = cursorPlan({
+      existing: inflated,
+      incoming: corrected,
+      recountProof: cursorProof(
+        cursorProofCell(1_000, 10, 4),
+        cursorProofCell(399, 4, 1)
+      ),
+    });
+
+    expect(mismatched.recountDays).toBeUndefined();
+    expect(mismatched.rejectedRecountDays).toEqual(["2026-10-08"]);
+    expect(mismatched.nextState?.days["2026-10-08"]?.tokens).toBe(1_000);
+  });
+
+  it("keeps a partial scan pending without applying its proof", () => {
+    const partial = cursorPlan({
+      existing: inflated,
+      incoming: corrected,
+      fullHistory: false,
+      recountProof: proof,
+    });
+
+    expect(partial.mode).toBe("freeze");
+    expect(partial.recountDays).toBeUndefined();
+    expect(partial.nextState?.baselineEstablished).toBe(false);
+
+    const followed = cursorPlan({
+      existing: inflated,
+      incoming: corrected,
+      state: partial.nextState,
+      recountProof: proof,
+    });
+    expect(followed.recountDays).toEqual(["2026-10-08"]);
+    expect(followed.nextState?.days["2026-10-08"]?.tokens).toBe(400);
+  });
+
+  it("keeps an empty full-history snapshot pending", () => {
+    const empty = cursorPlan({ existing: inflated, incoming: {} });
+
+    expect(empty.mode).toBe("freeze");
+    expect(empty.nextState?.baselineEstablished).toBe(false);
+
+    const followed = cursorPlan({
+      existing: inflated,
+      incoming: corrected,
+      state: empty.nextState,
+      recountProof: proof,
+    });
+    expect(followed.recountDays).toEqual(["2026-10-08"]);
+    expect(followed.nextState?.days["2026-10-08"]?.tokens).toBe(400);
+  });
+});
+
 describe("per-client full-history scope", () => {
   it("freezes only clients omitted from a new completeness declaration", () => {
     const scope = {

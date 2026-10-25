@@ -28,15 +28,18 @@ import { createSafeRecord, ownValue } from "../safeRecord";
  * trajectory steps. All three source labels are admitted and reconciled as one
  * family because the same provider response can appear in multiple surfaces.
  *
- * Devin CLI is registered at generation 2: generation 1 deduplicated
- * `message_nodes` rows by database row id and counted the same API request
- * once per persisted copy, while generation 2 deduplicates by
- * `metadata.request_id`. Because that generation counts the same history
- * strictly LOWER, neither the merge guard nor the high-water can heal the
- * inflation — both only ever defend stored values. See RECOUNT_PROOF_CLIENTS.
+ * Devin CLI and Cursor are registered at submission generation 2. Devin CLI
+ * generation 1 counted one API request once per persisted database row; Cursor
+ * generation 1 counted every running snapshot of one `usageEventId`. Their
+ * generation-2 parsers collapse those duplicates, so the same history counts
+ * strictly LOWER. Neither the merge guard nor the high-water can heal that
+ * inflation because both only ever defend stored values. Submission generations
+ * are independent of each client's local source-cache parser version. See
+ * RECOUNT_PROOF_CLIENTS.
  */
 export const SUPPORTED_VERSIONED_PARSERS: Readonly<Record<string, number>> = {
   copilot: 2,
+  cursor: 2,
   droid: 1,
   "devin-cli": 2,
   // v2 moves exported Amp messages from the synthesized thread-created day to
@@ -68,7 +71,8 @@ const SNAPSHOT_LAYOUT_CLIENTS: ReadonlySet<string> = new Set(["droid", "amp"]);
  * Clients whose REGISTERED generation counts the same history differently in
  * absolute terms — unlike SNAPSHOT_LAYOUT_CLIENTS, where tokens only move
  * between days, a recounting generation legitimately lowers the credited
- * lifetime (Devin CLI gen 2 drops duplicate-row counting).
+ * lifetime (Devin CLI drops duplicate database rows; Cursor drops repeated
+ * event snapshots).
  *
  * Every ledger this file maintains is monotonic, so deflation cannot flow
  * through increments or a coverage-gated replace: a stored inflated cell
@@ -102,7 +106,10 @@ const SNAPSHOT_LAYOUT_CLIENTS: ReadonlySet<string> = new Set(["droid", "amp"]);
  * anything, and an empty snapshot keeps the transition pending rather than
  * establishing a baseline the parser never actually read.
  */
-const RECOUNT_PROOF_CLIENTS: ReadonlySet<string> = new Set(["devin-cli"]);
+const RECOUNT_PROOF_CLIENTS: ReadonlySet<string> = new Set([
+  "cursor",
+  "devin-cli",
+]);
 
 /** One (day, model) cell as a parser generation counts it. */
 export interface RecountProofCell {
@@ -1281,14 +1288,15 @@ export function planParserHighWaterSubmission(args: {
   if (args.incomingVersion == null) {
     return args.state ? { mode: "freeze", increments: {} } : { mode: "status-quo", increments: {} };
   }
-  // Amp v1 and Devin CLI v1 are already released when their receivers deploy.
-  // Keep accepting them for devices that have not transitioned yet, but never
-  // let an older CLI rewrite a device after the receiver has started the new
-  // generation. This preserves the existing submit behavior during the
-  // server-before-CLI rollout without reopening a completed (or pending)
-  // transition to the old parser.
+  // Amp, Devin CLI, and Cursor v1 are already released when their receivers
+  // deploy. Keep accepting them for devices that have not transitioned yet,
+  // but never let an older CLI rewrite a device after the receiver has started
+  // the new generation. This preserves the server-before-CLI rollout without
+  // reopening a completed (or pending) transition to the old parser.
   if (
-    (args.client === "amp" || args.client === "devin-cli") &&
+    (args.client === "amp" ||
+      args.client === "cursor" ||
+      args.client === "devin-cli") &&
     args.incomingVersion === 1
   ) {
     return args.state
