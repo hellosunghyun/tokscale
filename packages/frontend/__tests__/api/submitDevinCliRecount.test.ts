@@ -1470,4 +1470,42 @@ describe("POST /api/submit cursor recount proof", () => {
       ),
     ).toBe(true);
   });
+
+  it("keeps Cursor usage the proof cannot explain across replays", async () => {
+    // The cache no longer holds every snapshot this device once submitted:
+    // the proof's rows explain 500 of the stored 1,000 tokens. Taking the
+    // proven 400 off on every submit would wear the day down to 100.
+    const store = newStore();
+    seedDay(store, "2026-10-08", {
+      [CURSOR_RECOUNT_CASE.client]: recountCell(
+        1_000,
+        10,
+        4,
+        CURSOR_RECOUNT_CASE.modelId,
+      ),
+    });
+    const partial = () =>
+      submissionBody(
+        [
+          {
+            date: "2026-10-08",
+            tokens: 100,
+            cost: 1,
+            messages: 1,
+            previous: { tokens: 500, cost: 5, messages: 2 },
+          },
+        ],
+        { recountClient: CURSOR_RECOUNT_CASE },
+      );
+
+    for (let replay = 0; replay < 3; replay += 1) {
+      await submit(store, partial());
+      const cell = store.days.find((day) => day.date === "2026-10-08")!
+        .sourceBreakdown[CURSOR_RECOUNT_CASE.client];
+      expect(cell.tokens).toBe(1_000);
+      expect(cell.cost).toBeCloseTo(10, 4);
+      expect(cell.messages).toBe(4);
+    }
+    expect(store.device.parserVersions[CURSOR_RECOUNT_CASE.client]).toBe(2);
+  });
 });
