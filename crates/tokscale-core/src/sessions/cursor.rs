@@ -393,9 +393,6 @@ fn parse_cost(cost_str: &str) -> f64 {
 /// same rows. `.csv` files are the legacy export format and keep the synthetic
 /// per-day session id for backward compatibility.
 pub fn parse_cursor_file(path: &Path) -> Vec<UnifiedMessage> {
-    #[cfg(test)]
-    record_parse_cursor_file_call(path);
-
     try_parse_cursor_file(path).unwrap_or_default()
 }
 
@@ -408,14 +405,24 @@ pub fn parse_cursor_file_deduped(path: &Path) -> Vec<UnifiedMessage> {
     dedupe_cursor_event_snapshots(parse_cursor_file(path))
 }
 
-/// Probe a source through the same read, container validation, and row parser
-/// entry point used on a cache miss. This stays separate from the source cache:
-/// a warm hit must not turn a now-unreadable file into complete history.
-pub fn cursor_source_is_readable(path: &Path) -> bool {
-    try_parse_cursor_file(path).is_some()
+/// Parse every accepted row like [`parse_cursor_file`], or return `None` when
+/// the source cannot be read as a Cursor cache at all (an unreadable file,
+/// invalid JSON, no `usageEventsDisplay` array, or a CSV without the Cursor
+/// header). An empty `Vec` is a readable cache that holds no usage.
+///
+/// The scan lane uses this on a cache miss to tell a source it could not read
+/// from one that is simply empty. A warm cache hit serves the rows of an
+/// unchanged file and needs no read check.
+pub(crate) fn parse_cursor_file_checked(path: &Path) -> Option<Vec<UnifiedMessage>> {
+    try_parse_cursor_file(path)
 }
 
+/// Every full parse of a Cursor cache goes through here, so the test counter
+/// sees each one, whichever entry point asked for it.
 fn try_parse_cursor_file(path: &Path) -> Option<Vec<UnifiedMessage>> {
+    #[cfg(test)]
+    record_parse_cursor_file_call(path);
+
     let is_json = path
         .extension()
         .and_then(|ext| ext.to_str())

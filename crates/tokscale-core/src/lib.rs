@@ -3605,23 +3605,32 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // so cold and warm scans can build the same proof from the same messages.
     if include_synthetic || clients.iter().any(|client| client == "cursor") {
         let cursor_paths = scan_result.get(ClientId::Cursor);
-        let cursor_outcomes: Vec<CachedParseOutcome> = cursor_paths
+        // Readability comes from the lane's own parse. A warm cache hit serves
+        // the rows of an unchanged file, so no history is missing there; only a
+        // parse can find a source that no longer reads. Probing every source
+        // again would reparse each Cursor cache on every scan.
+        let cursor_outcomes: Vec<(CachedParseOutcome, bool)> = cursor_paths
             .par_iter()
             .map(|path| {
+                let unreadable = std::cell::Cell::new(false);
                 let mut outcome = load_or_parse_source(
                     message_cache::CacheIdentity::for_client(ClientId::Cursor),
                     path,
                     &source_cache,
                     pricing,
-                    sessions::cursor::parse_cursor_file,
+                    |path| {
+                        let parsed = sessions::cursor::parse_cursor_file_checked(path);
+                        unreadable.set(parsed.is_none());
+                        parsed.unwrap_or_default()
+                    },
                 );
                 machine_labeler.label_messages(path, &mut outcome.messages);
-                outcome
+                (outcome, unreadable.get())
             })
             .collect();
-        let unreadable = cursor_paths
+        let unreadable = cursor_outcomes
             .iter()
-            .filter(|path| !sessions::cursor::cursor_source_is_readable(path))
+            .filter(|(_, unreadable)| *unreadable)
             .count();
         source_reads.insert(
             ClientId::Cursor.as_str().to_string(),
@@ -3632,7 +3641,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         );
 
         let mut cursor_proof = RecountProofBuilder::default();
-        for outcome in cursor_outcomes {
+        for (outcome, _) in cursor_outcomes {
             let keep = sessions::cursor::cursor_event_snapshot_keep_mask(&outcome.messages);
             for (message, kept) in outcome.messages.into_iter().zip(keep) {
                 if let Some((date, model_id)) = flushed_message_identity(&message, &flush_context) {
@@ -12973,15 +12982,18 @@ mod tests {
     }
 
     #[test]
-    fn cursor_read_probe_rejects_a_source_the_parser_silently_returns_as_empty() {
+    #[serial_test::serial]
+    fn cursor_scan_reports_sources_the_parser_silently_returns_as_empty() {
+        let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
         write_cursor_recount_fixtures(source_home.path());
         let broken_path = source_home
             .path()
             .join(".config/tokscale/cursor-cache/usage.broken.json");
         std::fs::write(&broken_path, r#"{"usageEventsDisplay":"not-an-array"}"#).unwrap();
         assert!(sessions::cursor::parse_cursor_file(&broken_path).is_empty());
-        assert!(!sessions::cursor::cursor_source_is_readable(&broken_path));
+        assert!(sessions::cursor::parse_cursor_file_checked(&broken_path).is_none());
         let broken_csv = source_home
             .path()
             .join(".config/tokscale/cursor-cache/usage.malformed.csv");
@@ -12992,22 +13004,27 @@ mod tests {
         )
         .unwrap();
         assert!(sessions::cursor::parse_cursor_file(&broken_csv).is_empty());
-        assert!(!sessions::cursor::cursor_source_is_readable(&broken_csv));
+        assert!(sessions::cursor::parse_cursor_file_checked(&broken_csv).is_none());
 
-        let mut messages = Vec::new();
-        let outcome = super::parse_all_messages_streaming(
-            source_home.path().to_str().unwrap(),
-            &["cursor".to_string()],
-            None,
-            false,
-            &scanner::ScannerSettings::default(),
-            SourceCachePolicy::InMemory,
-            &mut messages,
-        );
+        // A readable source is cached on the first scan and served warm on the
+        // second; the broken ones are never cached, so every scan reads them
+        // again and still reports them.
+        for scan in ["cold", "warm"] {
+            let mut messages = Vec::new();
+            let outcome = super::parse_all_messages_streaming(
+                source_home.path().to_str().unwrap(),
+                &["cursor".to_string()],
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+                SourceCachePolicy::Persistent,
+                &mut messages,
+            );
 
-        assert_eq!(outcome.source_reads["cursor"].discovered, 4);
-        assert_eq!(outcome.source_reads["cursor"].unreadable, 2);
-        assert!(!outcome.source_reads["cursor"].complete());
+            assert_eq!(outcome.source_reads["cursor"].discovered, 4, "{scan} scan");
+            assert_eq!(outcome.source_reads["cursor"].unreadable, 2, "{scan} scan");
+            assert!(!outcome.source_reads["cursor"].complete(), "{scan} scan");
+        }
     }
 
     #[test]
