@@ -80,14 +80,19 @@ const SNAPSHOT_LAYOUT_CLIENTS: ReadonlySet<string> = new Set(["droid", "amp"]);
  * full-history snapshot (`scanScope.recountProofs`): for each (day, model)
  * cell, what the previous generation counted from the same rows and what
  * this generation counts from them. At the device's transition to the new
- * generation, a stored cell drops to the corrected counts only when its token
- * and message counts are exactly what the previous generation counted from
- * those rows. Any other stored cell may hold usage the proof cannot describe
- * (a source deleted or no longer cached locally) and is kept exactly as it
- * is. After the transition a proof never lowers counts: the stored cells are
- * then in this generation's units, and matching counts no longer show which
- * rows they came from. A later proof may only finish a cost correction that
- * an incomplete snapshot postponed.
+ * generation, a stored cell drops to the corrected counts and cost only when
+ * its token and message counts are exactly what the previous generation
+ * counted from those rows. Any other stored cell may hold usage the proof
+ * cannot describe (a source deleted or no longer cached locally) and is kept
+ * exactly as it is. After the transition a proof changes no amounts: the
+ * stored cells are then in this generation's units, and matching counts no
+ * longer show which rows they came from. A later complete proof can only
+ * show that a floored cost is complete.
+ *
+ * The transition assumes every stored cell came from the previous generation.
+ * A receiver that did not version the client yet may already hold cells the
+ * new generation counted; such a cell drops only if its counts happen to
+ * equal a proof's previous side in all five token fields and messages.
  *
  * A non-fullHistory submit still freezes, so a partial scan never corrects
  * anything, and an empty snapshot keeps the transition pending rather than
@@ -190,18 +195,19 @@ export interface ParserHighWaterPlan {
   /** Absolute cells when `mode` is `replace`; omitted otherwise. */
   layoutDays?: Record<string, ClientBreakdownData>;
   /**
-   * Days whose recount proof agrees with this snapshot. The credited ledger
-   * behind `nextState` already has the proof applied on these days; the route
-   * applies `applyRecountProofToCell` to the stored cells of the same days,
-   * with the same `recountCostOnly`, before adding `increments`.
+   * Days whose recount proof agrees with this snapshot. With
+   * `recountTransition`, the credited ledger behind `nextState` already has
+   * the proof applied on these days, and the route applies
+   * `applyRecountProofToCell` to the stored cells of the same days before
+   * adding `increments`. Without it, the proof changes no amounts and the
+   * route only checks it with `recountProofProvesCost`.
    */
   recountDays?: string[];
   /**
-   * Set after the device's transition: the proof may only finish a cost
-   * correction that an incomplete snapshot postponed, and never lowers counts
-   * (`correctCounts: false`).
+   * Set on the device's transition to the recounting generation, the one
+   * submit whose proof corrects stored cells.
    */
-  recountCostOnly?: boolean;
+  recountTransition?: boolean;
   /** Days whose recount proof disagreed with the snapshot and was ignored. */
   rejectedRecountDays?: string[];
   nextState?: ParserClientHighWaterState;
@@ -598,30 +604,23 @@ export interface RecountCorrection {
   cell: ClientBreakdownData;
   /** What the correction removed from the stored cell. */
   removed: { tokens: number; cost: number; messages: number };
+  /** Whether any count or cost of the stored cell changed. */
+  changed: boolean;
   /**
-   * Which of the stored cell's models the proof restated. "all" means the
-   * cell's whole cost now rests on the proof; "none" means the cell is
-   * returned unchanged.
+   * Whether the proof now accounts for the corrected cell's whole cost: see
+   * `recountProofProvesCost`.
    */
-  restated: "all" | "some" | "none";
-}
-
-export interface RecountCorrectionOptions {
-  /**
-   * Whether the proof may lower token and message counts. Only a device's
-   * transition to the recounting generation may (see `applyRecountProofToCell`).
-   */
-  correctCounts: boolean;
+  costProven: boolean;
 }
 
 /**
- * Apply one day's recount proof to a stored cell.
+ * Apply one day's recount proof to a stored cell at the device's transition
+ * to the recounting generation.
  *
- * Counts are corrected only at the device's transition to the recounting
- * generation (`correctCounts`), while every stored cell still holds what the
- * previous generation counted. There, per model, a stored cell whose token
- * and message counts equal exactly what the previous generation counts from
- * the proof's rows drops to the corrected counts, and its cost drops to the
+ * This is the one submit at which every stored cell still holds what the
+ * previous generation counted. Per model, a stored cell whose token and
+ * message counts equal exactly what the previous generation counts from the
+ * proof's rows drops to the corrected counts, and its cost drops to the
  * corrected cost if the previous cost accounts for it (within one stored cost
  * unit). Any other cell is kept as stored. It holds usage the proof cannot
  * describe (a source deleted or no longer cached locally), or rows that
@@ -630,58 +629,47 @@ export interface RecountCorrectionOptions {
  * corrected counts must equal the submitted cell
  * (`recountProofDayMatchesSnapshot`).
  *
- * After the transition, a stored cell is in this generation's units
- * (corrected, credited by this generation, or kept), and the receiver keeps
- * no record of which rows it came from. Matching counts prove nothing then.
- * When one of two sources disappears, the remaining source's previous count
- * can equal the corrected day exactly, and lowering the day would erase the
- * other source. So a later proof never lowers counts, and replaying a proof
- * changes nothing.
+ * The corrected cost is right whether or not this snapshot priced every
+ * token: the proof removes the cost of rows it shows to be duplicates, and an
+ * unpriced row contributes to neither side. The route tags the cell when its
+ * cost is still a lower bound.
  *
- * In both phases a proof may finish a cost correction that an incomplete
- * snapshot postponed. A cell tagged `costIsComplete: false` whose counts equal
- * the corrected counts takes the corrected cost on the same terms. A complete
- * cost is never lowered this way, because equal counts alone do not show that
- * the cost came from the proof's rows.
+ * After the transition a stored cell is in this generation's units, and the
+ * receiver keeps no record of which rows it came from. Matching counts prove
+ * nothing then: when one of two sources disappears, the remaining source's
+ * previous count can equal the corrected day exactly, and lowering the day
+ * would erase the other source. So a later proof changes no amounts; it can
+ * only show that a floored cost is complete (`recountProofProvesCost`).
  *
  * Models the proof does not name are untouched; proof models the cell does
  * not hold have nothing to correct.
  */
 export function applyRecountProofToCell(
   stored: ClientBreakdownData,
-  proofDay: Record<string, RecountProofEntry>,
-  options: RecountCorrectionOptions
+  proofDay: Record<string, RecountProofEntry>
 ): RecountCorrection {
   const models = modelsForHighWater(stored);
   const removed = { tokens: 0, cost: 0, messages: 0 };
-  const costIsFloor = stored.provenance?.costIsComplete === false;
-  let restatedModels = 0;
   for (const [modelId, entry] of Object.entries(proofDay)) {
     const model = ownValue(models, modelId);
     if (!model || !proofCellIsOrdered(entry)) continue;
-    const countsEqual = (side: RecountProofCell) =>
-      PROOF_TOKEN_FIELDS.every((field) => model[field] === side.tokens[field]) &&
-      model.messages === side.messages;
-    const recount = options.correctCounts && countsEqual(entry.previous);
-    if (!recount && !(costIsFloor && countsEqual(entry.corrected))) continue;
+    if (!modelCountsEqual(model, entry.previous)) continue;
     const next = { ...model };
-    if (recount) {
-      const priorInclusiveInput = positive(
-        model.inputIncludingCacheRead ?? model.input + model.cacheRead
-      );
-      for (const field of PROOF_TOKEN_FIELDS) {
-        next[field] = entry.corrected.tokens[field];
-        removed.tokens += model[field] - next[field];
-      }
-      next.inputIncludingCacheRead = positive(
-        priorInclusiveInput -
-          (model.input - next.input) -
-          (model.cacheRead - next.cacheRead)
-      );
-      next.tokens = PROOF_TOKEN_FIELDS.reduce((sum, field) => sum + next[field], 0);
-      next.messages = entry.corrected.messages;
-      removed.messages += model.messages - next.messages;
+    const priorInclusiveInput = positive(
+      model.inputIncludingCacheRead ?? model.input + model.cacheRead
+    );
+    for (const field of PROOF_TOKEN_FIELDS) {
+      next[field] = entry.corrected.tokens[field];
+      removed.tokens += model[field] - next[field];
     }
+    next.inputIncludingCacheRead = positive(
+      priorInclusiveInput -
+        (model.input - next.input) -
+        (model.cacheRead - next.cacheRead)
+    );
+    next.tokens = PROOF_TOKEN_FIELDS.reduce((sum, field) => sum + next[field], 0);
+    next.messages = entry.corrected.messages;
+    removed.messages += model.messages - next.messages;
     // Stored and proof costs are sums of the same per-message prices and can
     // differ by floating-point noise, so a stored cost up to one stored cost
     // unit above `previous` still counts as accounted for. In that slack the
@@ -697,7 +685,6 @@ export function applyRecountProofToCell(
     );
     removed.cost += model.cost - next.cost;
     models[modelId] = next;
-    restatedModels += 1;
   }
   const cell = breakdownFromModels(models);
   // Re-derive provenance from the corrected totals, carrying the stored
@@ -708,27 +695,60 @@ export function applyRecountProofToCell(
     provenance: stored.provenance,
   });
   removed.cost = quantizeCost(removed.cost);
-  const restated =
-    restatedModels === 0
-      ? "none"
-      : restatedModels === Object.keys(models).length
-        ? "all"
-        : "some";
-  return { cell, removed, restated };
+  return {
+    cell,
+    removed,
+    changed: removed.tokens !== 0 || removed.cost !== 0 || removed.messages !== 0,
+    costProven: recountProofProvesCost(cell, proofDay),
+  };
+}
+
+function modelCountsEqual(model: ModelBreakdownData, side: RecountProofCell): boolean {
+  return (
+    PROOF_TOKEN_FIELDS.every((field) => model[field] === side.tokens[field]) &&
+    model.messages === side.messages
+  );
+}
+
+/**
+ * Whether a recount proof accounts for a stored cell's whole cost: every model
+ * of the cell is named by the proof, with exactly its corrected counts and its
+ * corrected cost (within one stored cost unit).
+ *
+ * The route uses this only to clear a floor tag on a complete snapshot, never
+ * to change an amount. Equal counts alone would not be enough: another
+ * source's cell can hold the same counts at a different cost.
+ */
+export function recountProofProvesCost(
+  stored: ClientBreakdownData,
+  proofDay: Record<string, RecountProofEntry>
+): boolean {
+  const models = Object.entries(modelsForHighWater(stored));
+  return (
+    models.length > 0 &&
+    models.every(([modelId, model]) => {
+      const entry = ownValue(proofDay, modelId);
+      return (
+        entry != null &&
+        proofCellIsOrdered(entry) &&
+        modelCountsEqual(model, entry.corrected) &&
+        Math.abs(model.cost - entry.corrected.cost) <= PROOF_COST_TOLERANCE
+      );
+    })
+  );
 }
 
 function applyRecountProofToDays(
   days: Record<string, ClientBreakdownData>,
   proof: ClientRecountProof,
-  dates: readonly string[],
-  options: RecountCorrectionOptions
+  dates: readonly string[]
 ): Record<string, ClientBreakdownData> {
   const next = normalizeStateDays(days);
   for (const date of dates) {
     const stored = ownValue(next, date);
     const proofDay = ownValue(proof, date);
     if (!stored || !proofDay) continue;
-    next[date] = applyRecountProofToCell(stored, proofDay, options).cell;
+    next[date] = applyRecountProofToCell(stored, proofDay).cell;
   }
   return next;
 }
@@ -1129,11 +1149,11 @@ export function planParserHighWaterSubmission(args: {
   if (args.state && !validState(args.state, supportedVersion)) {
     return { mode: "freeze", increments: {} };
   }
-  // A recount proof is applied to the credited ledger BEFORE growth is
-  // allocated against it. At the transition it corrects counts; afterwards it
-  // may only finish a postponed cost correction. The snapshot then raises any
-  // cell left below it, bounded as ever by provable growth, so a corrected
-  // cell converges on the truth from either side.
+  // At the transition a recount proof corrects the credited ledger BEFORE
+  // growth is allocated against it. The snapshot then raises any cell the
+  // correction left below it, bounded as ever by provable growth, so a
+  // corrected cell converges on the truth from either side. After the
+  // transition a proof changes no amounts (see `applyRecountProofToCell`).
   const proof = RECOUNT_PROOF_CLIENTS.has(args.client)
     ? args.recountProof
     : undefined;
@@ -1141,11 +1161,10 @@ export function planParserHighWaterSubmission(args: {
     ? partitionRecountProof(proof, args.incomingDays)
     : { accepted: [], rejected: [] };
   const correctLedger = (
-    days: Record<string, ClientBreakdownData>,
-    options: RecountCorrectionOptions
+    days: Record<string, ClientBreakdownData>
   ): Record<string, ClientBreakdownData> =>
     proof && recount.accepted.length > 0
-      ? applyRecountProofToDays(days, proof, recount.accepted, options)
+      ? applyRecountProofToDays(days, proof, recount.accepted)
       : days;
   const recountFields = {
     ...(recount.accepted.length > 0 ? { recountDays: recount.accepted } : {}),
@@ -1155,10 +1174,8 @@ export function planParserHighWaterSubmission(args: {
   };
   if (args.state == null || args.state.baselineEstablished === false) {
     // Every stored cell still holds what the previous generation counted, so
-    // this is the one submit whose proof may lower counts.
-    const existingLegacyDays = correctLedger(args.existingLegacyDays, {
-      correctCounts: true,
-    });
+    // this is the one submit whose proof corrects stored cells.
+    const existingLegacyDays = correctLedger(args.existingLegacyDays);
     const legacyAggregate = aggregateSnapshot(existingLegacyDays);
     const hasLegacy =
       legacyAggregate.tokens > 0 || legacyAggregate.messages > 0;
@@ -1223,25 +1240,19 @@ export function planParserHighWaterSubmission(args: {
       increments,
       nextState,
       ...recountFields,
+      ...(recount.accepted.length > 0 ? { recountTransition: true } : {}),
     };
   }
   // State written before allocation schema v2 stored every observed cell
   // maximum and advanced its aggregate even when no cell could accept that
   // growth. Rebuild that one-time migration baseline from the rows that were
   // actually credited, otherwise already-suppressed usage remains lost.
-  // After the transition a proof never lowers counts (see
-  // `applyRecountProofToCell`); it may only finish a postponed cost correction.
-  const previousCreditedDays = correctLedger(
+  const previousCreditedDays =
     args.state.stateVersion === PARSER_HIGH_WATER_STATE_VERSION
       ? args.state.days
-      : args.existingLegacyDays,
-    { correctCounts: false }
-  );
-  // A v2 aggregate must describe exactly the credited cells (see validState),
-  // so once a correction touched them it is re-derived rather than reused.
+      : args.existingLegacyDays;
   const previousAggregate =
-    args.state.stateVersion === PARSER_HIGH_WATER_STATE_VERSION &&
-    recount.accepted.length === 0
+    args.state.stateVersion === PARSER_HIGH_WATER_STATE_VERSION
       ? args.state.aggregate
       : aggregateSnapshot(previousCreditedDays);
   const previousObservedDays =
@@ -1278,7 +1289,6 @@ export function planParserHighWaterSubmission(args: {
       args.incomingDays
     ),
     ...recountFields,
-    ...(recount.accepted.length > 0 ? { recountCostOnly: true } : {}),
   };
 }
 
