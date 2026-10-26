@@ -1040,7 +1040,8 @@ function allocateIncrements(
   // Keep the complete credited lifetime in the budget. A client-reported
   // retention boundary cannot prove that a missing old cell was pruned rather
   // than re-dated into this snapshot, so excluding it could credit it twice.
-  // PER_DAY_GROWTH_CLIENTS never re-date, so their budget is per day instead.
+  // PER_DAY_GROWTH_CLIENTS budget per day instead: their generations only drop
+  // rows, and each event is assumed to keep its day (see the set's comment).
   let tokenBudget = perDay
     ? Number.POSITIVE_INFINITY
     : positive(incomingAggregate.tokens - previousAggregate.tokens);
@@ -1296,7 +1297,8 @@ function validState(
  * actually written advance the credited ledger, so growth cannot be lost.
  * Date/model reshuffles and deleted local history never erase stored rows.
  * PER_DAY_GROWTH_CLIENTS bound that growth per day instead of by the lifetime
- * high-water, because their generations never re-date usage.
+ * high-water, because their generations only drop rows and each event is
+ * assumed to keep its day.
  *
  * SNAPSHOT_LAYOUT_CLIENTS are the deliberate exception to both absolutes
  * above: once a full snapshot's aggregate covers the credited one, the stored
