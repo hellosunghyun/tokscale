@@ -11,6 +11,7 @@ import {
   type ParserClientHighWaterState,
   type ParserHighWaterPlan,
   type RecountProofCell,
+  type RecountProofEntry,
 } from "../../src/lib/db/parserHighWater";
 import {
   mergeClientBreakdownsWithRegressionGuard,
@@ -113,6 +114,10 @@ function expectCreditedNothing(plan: ParserHighWaterPlan) {
   expect(plan.mode).not.toBe("freeze");
 }
 
+
+/** `applyRecountProofToCell` contexts used below. */
+const AT_TRANSITION = { transition: true, costIsComplete: true, storedCostIsFloor: false } as const;
+const AT_TRANSITION_FLOOR = { ...AT_TRANSITION, storedCostIsFloor: true } as const;
 describe("non-destructive parser generation high-water", () => {
   it("treats prototype-named model IDs as ordinary untrusted keys", () => {
     const first = baseline(
@@ -1588,6 +1593,25 @@ describe("devin-cli recount proof", () => {
     );
   }
 
+  /** What a snapshot submits for one proof day when its cost was safe: the corrected side. */
+  function submittedFor(proofDay: Record<string, RecountProofEntry>): ClientBreakdownData {
+    return foldParserClientSnapshot(
+      [
+        {
+          date: "2026-10-08",
+          clients: Object.entries(proofDay).map(([modelId, entry]) => ({
+            client: "devin-cli",
+            modelId,
+            tokens: { ...entry.corrected.tokens },
+            cost: entry.corrected.cost,
+            messages: entry.corrected.messages,
+          })),
+        },
+      ],
+      "devin-cli"
+    )["2026-10-08"];
+  }
+
   function devinPlan(
     existingLegacyDays: Record<string, ClientBreakdownData>,
     incomingDays: Record<string, ClientBreakdownData>,
@@ -1978,8 +2002,9 @@ describe("devin-cli recount proof", () => {
     const proofDay = proof({
       "2026-10-08": { previous: proofCell(3_000, 30), corrected: proofCell(1_200, 8) },
     })["2026-10-08"];
+    const submitted = submittedFor(proofDay);
 
-    const exact = applyRecountProofToCell(stored, proofDay);
+    const exact = applyRecountProofToCell(stored, proofDay, submitted, AT_TRANSITION_FLOOR);
     expect(exact.cell.tokens).toBe(1_200);
     expect(exact.cell.cost).toBeCloseTo(8, 4);
     expect(exact.cell.models["swe-2-high"].cost).toBeCloseTo(8, 4);
@@ -1992,11 +2017,21 @@ describe("devin-cli recount proof", () => {
     // A stored cost already partly corrected stops at the corrected cost
     // rather than taking the full proven difference off again.
     const partlyCorrected = { ...stored, cost: 15, models: { "swe-2-high": { ...stored.models["swe-2-high"], cost: 15 } } };
-    expect(applyRecountProofToCell(partlyCorrected, proofDay).cell.cost).toBeCloseTo(8, 4);
+    expect(applyRecountProofToCell(partlyCorrected, proofDay, submitted, AT_TRANSITION).cell.cost).toBeCloseTo(8, 4);
 
-    // A stored cost below the corrected cost is not touched.
+    // A complete stored cost below the corrected cost is not touched; a floor
+    // there is raised to the corrected cost, which prices exactly its rows.
     const belowCorrected = { ...stored, cost: 5, models: { "swe-2-high": { ...stored.models["swe-2-high"], cost: 5 } } };
-    expect(applyRecountProofToCell(belowCorrected, proofDay).cell.cost).toBeCloseTo(5, 4);
+    expect(applyRecountProofToCell(belowCorrected, proofDay, submitted, AT_TRANSITION).cell.cost).toBeCloseTo(5, 4);
+    expect(applyRecountProofToCell(belowCorrected, proofDay, submitted, AT_TRANSITION_FLOOR).cell.cost).toBeCloseTo(8, 4);
+
+    // An incomplete snapshot keeps every stored cost as a floor.
+    const incomplete = applyRecountProofToCell(stored, proofDay, submitted, {
+      ...AT_TRANSITION_FLOOR,
+      costIsComplete: false,
+    });
+    expect(incomplete.cell.tokens).toBe(1_200);
+    expect(incomplete.cell.cost).toBeCloseTo(30, 4);
   });
 
   it("treats a stored cost within one stored unit above the previous cost as explained", () => {
@@ -2012,9 +2047,9 @@ describe("devin-cli recount proof", () => {
       "2026-10-08": { previous: proofCell(3_000, 30), corrected: proofCell(1_200, 8) },
     })["2026-10-08"];
 
-    expect(applyRecountProofToCell(withCost(30.00005), proofDay).cell.cost).toBeCloseTo(8, 4);
+    expect(applyRecountProofToCell(withCost(30.00005), proofDay, submittedFor(proofDay), AT_TRANSITION).cell.cost).toBeCloseTo(8, 4);
     // Beyond that slack the stored cost holds spend the proof does not explain.
-    expect(applyRecountProofToCell(withCost(30.0003), proofDay).cell.cost).toBeCloseTo(30.0003, 4);
+    expect(applyRecountProofToCell(withCost(30.0003), proofDay, submittedFor(proofDay), AT_TRANSITION).cell.cost).toBeCloseTo(30.0003, 4);
   });
 
   it("proves a cost only when every model holds exactly the corrected counts and cost", () => {
@@ -2024,18 +2059,18 @@ describe("devin-cli recount proof", () => {
     const cell = (tokens: number, cost: number) =>
       devinSnapshot(devinContribution("2026-10-08", tokens, "swe-2-high", cost, 1))["2026-10-08"];
 
-    expect(recountProofProvesCost(cell(100, 0.1), proofDay)).toBe(true);
+    expect(recountProofProvesCost(cell(100, 0.1), proofDay, submittedFor(proofDay))).toBe(true);
     // Within one stored cost unit of the raw proof cost.
-    expect(recountProofProvesCost(cell(100, 0.10005), proofDay)).toBe(true);
+    expect(recountProofProvesCost(cell(100, 0.10005), proofDay, submittedFor(proofDay))).toBe(true);
     // Another source's cell can hold the same counts at a different cost.
-    expect(recountProofProvesCost(cell(100, 0.15), proofDay)).toBe(false);
-    expect(recountProofProvesCost(cell(200, 0.2), proofDay)).toBe(false);
+    expect(recountProofProvesCost(cell(100, 0.15), proofDay, submittedFor(proofDay))).toBe(false);
+    expect(recountProofProvesCost(cell(200, 0.2), proofDay, submittedFor(proofDay))).toBe(false);
     // A model the proof does not name keeps the cell unproven.
     const twoModels = devinSnapshot(
       devinContribution("2026-10-08", 100, "swe-2-high", 0.1, 1),
       devinContribution("2026-10-08", 50, "swe-1-5", 0.05, 1)
     )["2026-10-08"];
-    expect(recountProofProvesCost(twoModels, proofDay)).toBe(false);
+    expect(recountProofProvesCost(twoModels, proofDay, submittedFor(proofDay))).toBe(false);
   });
 
   it("reports what the transition's correction changed and whether it proves the cost", () => {
@@ -2045,7 +2080,9 @@ describe("devin-cli recount proof", () => {
 
     const exact = applyRecountProofToCell(
       devinSnapshot(devinContribution("2026-10-08", 200, "swe-2-high", 0.2, 2))["2026-10-08"],
-      proofDay
+      proofDay,
+      submittedFor(proofDay),
+      AT_TRANSITION
     );
     expect(exact.changed).toBe(true);
     expect(exact.costProven).toBe(true);
@@ -2055,7 +2092,9 @@ describe("devin-cli recount proof", () => {
     // account for is kept, so the proof does not stand behind it.
     const unexplainedCost = applyRecountProofToCell(
       devinSnapshot(devinContribution("2026-10-08", 200, "swe-2-high", 0.5, 2))["2026-10-08"],
-      proofDay
+      proofDay,
+      submittedFor(proofDay),
+      AT_TRANSITION
     );
     expect(unexplainedCost.changed).toBe(true);
     expect(unexplainedCost.costProven).toBe(false);
@@ -2069,7 +2108,9 @@ describe("devin-cli recount proof", () => {
         devinContribution("2026-10-08", 200, "swe-2-high", 0.2, 2),
         devinContribution("2026-10-08", 50, "swe-1-5", 0.05, 1)
       )["2026-10-08"],
-      proofDay
+      proofDay,
+      submittedFor(proofDay),
+      AT_TRANSITION
     );
     expect(partly.changed).toBe(true);
     expect(partly.costProven).toBe(false);
@@ -2080,10 +2121,40 @@ describe("devin-cli recount proof", () => {
     // and its cost are returned unchanged.
     const sameCounts = applyRecountProofToCell(
       devinSnapshot(devinContribution("2026-10-08", 100, "swe-2-high", 0.15, 1))["2026-10-08"],
-      proofDay
+      proofDay,
+      submittedFor(proofDay),
+      AT_TRANSITION
     );
     expect(sameCounts.changed).toBe(false);
     expect(sameCounts.cell.cost).toBeCloseTo(0.15, 4);
+  });
+
+  it("keeps a model's stored cost when the proof's cost is not what the snapshot submitted", () => {
+    // Submission zeroed an estimate it could not price safely after the proof
+    // was built, so the proof's $0.10 rests on that estimate. The counts are
+    // corrected; the stored $0.15 is kept.
+    const proofDay = proof({
+      "2026-10-08": { previous: proofCell(200, 0.2, 2), corrected: proofCell(100, 0.1, 1) },
+    })["2026-10-08"];
+    const zeroed = devinSnapshot(devinContribution("2026-10-08", 100, "swe-2-high", 0, 1))["2026-10-08"];
+    const stored = devinSnapshot(devinContribution("2026-10-08", 200, "swe-2-high", 0.15, 2))["2026-10-08"];
+
+    const correction = applyRecountProofToCell(stored, proofDay, zeroed, AT_TRANSITION);
+    // The same on the incomplete day the submission actually marked.
+    expect(
+      applyRecountProofToCell(stored, proofDay, zeroed, { ...AT_TRANSITION, costIsComplete: false }).cell.cost
+    ).toBeCloseTo(0.15, 4);
+    expect(correction.changed).toBe(true);
+    expect(correction.costProven).toBe(false);
+    expect(correction.cell.tokens).toBe(100);
+    expect(correction.cell.messages).toBe(1);
+    expect(correction.cell.cost).toBeCloseTo(0.15, 4);
+    expect(correction.removed).toEqual({ tokens: 100, cost: 0, messages: 1 });
+
+    // Nor does such a proof show a cost to be complete.
+    const atCorrected = devinSnapshot(devinContribution("2026-10-08", 100, "swe-2-high", 0.1, 1))["2026-10-08"];
+    expect(recountProofProvesCost(atCorrected, proofDay, zeroed)).toBe(false);
+    expect(recountProofProvesCost(atCorrected, proofDay, submittedFor(proofDay))).toBe(true);
   });
 
   it("keeps generation-1 submissions compatible before the transition", () => {
@@ -2202,10 +2273,12 @@ describe("devin-cli recount proof", () => {
     expect(plan.nextState?.days["2026-10-08"]?.cost).toBe(20);
   });
 
-  it("accepts a proof whose corrected cost exceeds a submission that zeroed unpriced rows", () => {
+  it("accepts a proof whose corrected cost exceeds a submission that zeroed unpriced rows, keeping the stored cost", () => {
     const stored = devinSnapshot(devinContribution("2026-10-08", 1_000, "swe-2-high", 20));
     // Submission zeroes cost it cannot price after the proof was built, so
-    // the snapshot may carry LESS cost than the proof's corrected side.
+    // the snapshot may carry LESS cost than the proof's corrected side. The
+    // proof still corrects the counts, but its $9 rests on that unsafe cost,
+    // so the stored $20 stays, as the route keeps it for the stored cell.
     const scan = devinSnapshot(devinContribution("2026-10-08", 455, "swe-2-high", 0));
     const plan = devinPlan(stored, scan, {
       recountProof: proof({
@@ -2215,7 +2288,7 @@ describe("devin-cli recount proof", () => {
 
     expect(plan.recountDays).toEqual(["2026-10-08"]);
     expect(plan.nextState?.days["2026-10-08"]?.tokens).toBe(455);
-    expect(plan.nextState?.days["2026-10-08"]?.cost).toBe(9);
+    expect(plan.nextState?.days["2026-10-08"]?.cost).toBe(20);
   });
 
   it("applies an all-duplicate proof day the snapshot does not date", () => {
