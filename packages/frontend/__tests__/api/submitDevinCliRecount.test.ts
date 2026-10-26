@@ -1509,6 +1509,43 @@ describe("POST /api/submit cursor recount proof", () => {
     expect(store.device.parserVersions[CURSOR_RECOUNT_CASE.client]).toBe(2);
   });
 
+  it("keeps a Cursor day's cost while a moved snapshot's survivor is unpriced", async () => {
+    // Real Cursor snapshots keep their event's day (#1544). If one did not,
+    // every stored row on the 8th could be an earlier snapshot of an event
+    // whose survivor is dated the 9th, which this submission could not price.
+    // The proof shows the model without a survivor on the 8th, so its cost
+    // waits for the 9th to be priced.
+    const store = newStore();
+    seedDay(store, "2026-10-08", {
+      [CURSOR_RECOUNT_CASE.client]: recountCell(100, 0.15, 1, CURSOR_RECOUNT_CASE.modelId),
+    });
+    const options = (costIsComplete: boolean) => ({
+      recountClient: CURSOR_RECOUNT_CASE,
+      costIsComplete,
+      allDuplicateDays: [{ date: "2026-10-08", previous: { tokens: 100, cost: 0.2, messages: 1 } }],
+    });
+    const ninth = (cost: number) => [
+      {
+        date: "2026-10-09",
+        tokens: 100,
+        cost,
+        messages: 1,
+        previous: { tokens: 100, cost: 0.15, messages: 1 },
+        provenCorrected: { tokens: 100, cost: 0.15, messages: 1 },
+      },
+    ];
+
+    await submit(store, submissionBody(ninth(0), options(false)));
+    const floored = store.days.find((day) => day.date === "2026-10-08")?.sourceBreakdown[CURSOR_RECOUNT_CASE.client];
+    expect(floored?.tokens).toBe(0);
+    expect(floored?.cost).toBeCloseTo(0.15, 4);
+    expect(floored?.provenance?.costIsComplete).toBe(false);
+
+    await submit(store, submissionBody(ninth(0.15), options(true)));
+    expect(storedClientTokens(store, "2026-10-08", CURSOR_RECOUNT_CASE.client)).toBeUndefined();
+    expect(storedCost(store)).toBeCloseTo(0.15, 4);
+  });
+
   it("keeps a corrected Cursor day when one of its accounts is logged out", async () => {
     // Accounts A and B both used Cursor on 2026-10-08: 200 tokens each under
     // generation 1, 100 each once snapshots are collapsed. The first

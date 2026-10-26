@@ -131,6 +131,14 @@ const RECOUNT_PROOF_CLIENTS: ReadonlySet<string> = new Set([
  * the snapshots of a real profile do (#1544). An event whose later snapshot
  * moved to another day after the transition would be credited on both days,
  * as the ordinary per-day merge did.
+ *
+ * The same assumption puts every duplicate snapshot on its survivor's day, so
+ * a recount proof moves a Cursor model's cost on that day's own pricing,
+ * whatever other days hold (`recountCostUnsafeModels`). A model the proof
+ * shows with no survivor on some day contradicts that for itself and still
+ * waits while any proof day is unpriced, as for every client. An event whose
+ * snapshots moved only in part cannot be told apart; if its survivor's day is
+ * unpriced, the moved snapshot's cost can be dropped with it.
  */
 const PER_DAY_GROWTH_CLIENTS: ReadonlySet<string> = new Set(["cursor"]);
 
@@ -895,11 +903,13 @@ function applyRecountProofToDays(
  * - Every model the proof names once any of its days was rejected.
  * - Models the proof names on a day the snapshot could not price completely.
  *   A duplicate usually shares its survivor's model, and every day holding
- *   either is then a proof day for that model.
+ *   either is then a proof day for that model. A client whose duplicates
+ *   share their survivor's day (`survivorsShareTheirDay`) skips this: the
+ *   day's own pricing vouches for the cost it moves.
  * - While any proof day is unpriced, models the proof shows with no survivor
  *   on some day. Their duplicates' survivors lie on other days, possibly
- *   under another model id (a Devin CLI copy without its generation model), so
- *   no day's pricing can vouch for them alone.
+ *   under another model id (a Devin CLI copy without its generation model, or
+ *   a moved Cursor snapshot), so no day's pricing can vouch for them alone.
  *
  * A model with survivors whose duplicates also have survivors on another,
  * unpriced day under another model id cannot be told apart from the proof.
@@ -907,7 +917,8 @@ function applyRecountProofToDays(
 export function recountCostUnsafeModels(
   proof: ClientRecountProof,
   recount: { accepted: readonly string[]; rejected: readonly string[] },
-  costIncompleteDates: ReadonlySet<string>
+  costIncompleteDates: ReadonlySet<string>,
+  survivorsShareTheirDay = false
 ): Set<string> {
   const unsafe = new Set<string>();
   if (recount.rejected.length > 0) {
@@ -920,9 +931,11 @@ export function recountCostUnsafeModels(
     costIncompleteDates.has(date)
   );
   if (unpricedDates.length === 0) return unsafe;
-  for (const date of unpricedDates) {
-    for (const modelId of Object.keys(ownValue(proof, date) ?? {})) {
-      unsafe.add(modelId);
+  if (!survivorsShareTheirDay) {
+    for (const date of unpricedDates) {
+      for (const modelId of Object.keys(ownValue(proof, date) ?? {})) {
+        unsafe.add(modelId);
+      }
     }
   }
   for (const modelId of modelsWithoutSurvivors(proof, recount.accepted)) {
@@ -1409,7 +1422,12 @@ export function planParserHighWaterSubmission(args: {
     : { accepted: [], rejected: [] };
   const costIncompleteDates = args.costIncompleteDates ?? new Set<string>();
   const costUnsafeModels = proof
-    ? recountCostUnsafeModels(proof, recount, costIncompleteDates)
+    ? recountCostUnsafeModels(
+        proof,
+        recount,
+        costIncompleteDates,
+        PER_DAY_GROWTH_CLIENTS.has(args.client)
+      )
     : new Set<string>();
   const correctLedger = (
     days: Record<string, ClientBreakdownData>,

@@ -2525,6 +2525,35 @@ describe("cursor recount proof rollout", () => {
     cursorProofCell(400, 4, 1)
   );
 
+  it("moves a Cursor model's cost on its own day's pricing", () => {
+    // The same model also appears on the unpriced 9th. Cursor's duplicates
+    // share their survivor's day, so the priced 8th still heals its cost;
+    // Devin CLI, whose duplicates can cross midnight, would keep it.
+    const plan = planParserHighWaterSubmission({
+      client,
+      incomingVersion: SUPPORTED_VERSIONED_PARSERS.cursor,
+      fullHistory: true,
+      existingLegacyDays: cursorSnapshot(cursorContribution("2026-10-08", 200, 2, 2)),
+      incomingDays: cursorSnapshot(
+        cursorContribution("2026-10-08", 100, 1, 1),
+        cursorContribution("2026-10-09", 50, 0, 1)
+      ),
+      recountProof: {
+        "2026-10-08": {
+          [modelId]: { previous: cursorProofCell(200, 2, 2), corrected: cursorProofCell(100, 1, 1) },
+        },
+        "2026-10-09": {
+          [modelId]: { previous: cursorProofCell(50, 0.5, 1), corrected: cursorProofCell(50, 0.5, 1) },
+        },
+      },
+      costIncompleteDates: new Set(["2026-10-09"]),
+    });
+
+    expect(plan.recountCostUnsafeModels).toBeUndefined();
+    expect(plan.nextState?.days["2026-10-08"]?.tokens).toBe(100);
+    expect(plan.nextState?.days["2026-10-08"]?.cost).toBeCloseTo(1, 4);
+  });
+
   it("registers generation 2 while accepting generation 1 until transition", () => {
     expect(SUPPORTED_VERSIONED_PARSERS.cursor).toBe(2);
 
