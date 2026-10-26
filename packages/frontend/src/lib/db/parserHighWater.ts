@@ -1042,6 +1042,7 @@ function normalizedDayTotals(day: ClientBreakdownData | undefined): {
 }
 
 function allocateIncrements(
+  client: string,
   previousCreditedDays: Record<string, ClientBreakdownData>,
   previousObservedDays: Record<string, ClientBreakdownData>,
   incomingDays: Record<string, ClientBreakdownData>,
@@ -1234,11 +1235,26 @@ function allocateIncrements(
     Record<string, ModelBreakdownData>
   >();
   for (const cell of cells) {
-    if (cell.increment.tokens > 0) {
-      const acceptedFraction =
-        cell.tokenCapacity > 0
-          ? cell.increment.tokens / cell.tokenCapacity
-          : 0;
+    let acceptedFraction =
+      cell.increment.tokens > 0 && cell.tokenCapacity > 0
+        ? cell.increment.tokens / cell.tokenCapacity
+        : 0;
+    // Cursor's legacy premium-tool-call rows are billed per invocation, not
+    // per token, and are explicitly admitted by submission validation. Their
+    // message growth authorizes the same fraction of marginal cost that token
+    // growth does for normal rows. Keep this narrow: repricing with no new
+    // messages, another tokenless model, or a formerly token-bearing cell
+    // must not turn into newly credited spend.
+    if (
+      client === "cursor" &&
+      cell.modelId === "premium-tool-call" &&
+      cell.model.tokens === 0 &&
+      (cell.credited?.tokens ?? 0) === 0 &&
+      cell.messageCapacity > 0
+    ) {
+      acceptedFraction = cell.increment.messages / cell.messageCapacity;
+    }
+    if (acceptedFraction > 0) {
       const marginalCost = positive(
         cell.model.cost - (cell.credited?.cost ?? 0)
       );
@@ -1496,6 +1512,7 @@ export function planParserHighWaterSubmission(args: {
     // that provable remainder.
     const increments = hasLegacy
       ? allocateIncrements(
+          args.client,
           existingLegacyDays,
           existingLegacyDays,
           args.incomingDays,
@@ -1556,6 +1573,7 @@ export function planParserHighWaterSubmission(args: {
   });
   if (followed) return followed;
   const increments = allocateIncrements(
+    args.client,
     previousCreditedDays,
     previousObservedDays,
     args.incomingDays,

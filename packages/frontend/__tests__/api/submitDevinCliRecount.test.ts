@@ -1609,3 +1609,77 @@ describe("POST /api/submit cursor recount proof", () => {
     ).toBe(false);
   });
 });
+
+describe("POST /api/submit legacy Cursor tokenless cost", () => {
+  it("credits a newly discovered legacy day once after the parser baseline", async () => {
+    const store = newStore();
+    const options = {
+      recountClient: { ...CURSOR_RECOUNT_CASE, modelId: "premium-tool-call" },
+    };
+    const original = { date: "2025-04-14", tokens: 0, cost: 0.02, messages: 1 };
+    const discovered = { date: "2025-04-15", tokens: 0, cost: 0.02, messages: 1 };
+    await submit(store, submissionBody([original], options));
+    expect(storedCost(store)).toBeCloseTo(0.02, 4);
+    const rescan = [original, discovered].map((day) => ({
+      ...day,
+      previous: { tokens: day.tokens, cost: day.cost, messages: day.messages },
+    }));
+    for (let replay = 0; replay < 3; replay++) {
+      await submit(store, submissionBody(rescan, options));
+      const stored = store.days.find((day) => day.date === discovered.date)!
+        .sourceBreakdown.cursor;
+      const ledger = store.device.parserStates.cursor as ParserClientHighWaterState;
+      expect(stored.messages).toBe(1);
+      expect(stored.cost).toBeCloseTo(0.02, 4);
+      expect(ledger.days[discovered.date]?.cost).toBeCloseTo(stored.cost, 4);
+      expect(storedCost(store)).toBeCloseTo(0.04, 4);
+    }
+  });
+
+  it.each([
+    { modelId: "premium-tool-call", beforeTokens: 0, afterTokens: 0 },
+    { modelId: "gemini-4-argon-medium", beforeTokens: 100, afterTokens: 200 },
+  ])(
+    "credits new $modelId usage without repricing or replaying its cost",
+    async ({ modelId, beforeTokens, afterTokens }) => {
+      const store = newStore();
+      const options = { recountClient: { ...CURSOR_RECOUNT_CASE, modelId } };
+      const date = "2025-04-15";
+      await submit(
+        store,
+        submissionBody(
+          [{ date, tokens: beforeTokens, cost: 0.02, messages: 1 }],
+          options,
+        ),
+      );
+      const grown = { date, tokens: afterTokens, cost: 0.05, messages: 2 };
+      const scan = {
+        ...grown,
+        previous: {
+          tokens: grown.tokens,
+          cost: grown.cost,
+          messages: grown.messages,
+        },
+      };
+      for (let replay = 0; replay < 3; replay++) {
+        await submit(store, submissionBody([scan], options));
+        const stored = store.days.find((day) => day.date === date)!
+          .sourceBreakdown.cursor;
+        const ledger = store.device.parserStates.cursor as ParserClientHighWaterState;
+        expect(stored.tokens).toBe(afterTokens);
+        expect(stored.messages).toBe(2);
+        expect(stored.cost).toBeCloseTo(0.05, 4);
+        expect(ledger.days[date]?.cost).toBeCloseTo(stored.cost, 4);
+      }
+      // A new price without a new billed invocation/token is not new spend.
+      await submit(
+        store,
+        submissionBody(
+          [{ ...scan, cost: 0.09, previous: { ...scan.previous, cost: 0.09 } }],
+          options,
+        ),
+      );
+      expect(storedCost(store)).toBeCloseTo(0.05, 4);
+    },
+  );
+});

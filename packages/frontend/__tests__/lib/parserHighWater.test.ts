@@ -2998,3 +2998,169 @@ describe("unverified retention floor", () => {
     expect(plan.increments).toEqual({});
   });
 });
+
+describe("Cursor legacy tokenless cost allocation", () => {
+  const date = "2025-04-15";
+  function snapshot(
+    rows: Array<{
+      date?: string;
+      modelId?: string;
+      tokens?: number;
+      messages: number;
+      cost: number;
+    }>,
+    client = "cursor",
+  ) {
+    return foldParserClientSnapshot(
+      rows.map((row) => ({
+        date: row.date ?? date,
+        clients: [{
+          client,
+          modelId: row.modelId ?? "premium-tool-call",
+          tokens: {
+            input: row.tokens ?? 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            reasoning: 0,
+          },
+          messages: row.messages,
+          cost: row.cost,
+        }],
+      })),
+      client,
+    );
+  }
+  function plan(
+    stored: Record<string, ClientBreakdownData>,
+    incoming: Record<string, ClientBreakdownData>,
+    state?: ParserClientHighWaterState,
+    client = "cursor",
+  ) {
+    return planParserHighWaterSubmission({
+      client,
+      incomingVersion: SUPPORTED_VERSIONED_PARSERS[client],
+      fullHistory: true,
+      existingLegacyDays: stored,
+      incomingDays: incoming,
+      state,
+    });
+  }
+
+  it("credits a newly discovered tokenless day's cost once", () => {
+    const stored = snapshot([{
+      date: "2026-10-25",
+      modelId: "gpt-4o",
+      tokens: 100,
+      messages: 1,
+      cost: 1,
+    }]);
+    const incoming = { ...stored, ...snapshot([{ messages: 1, cost: 0.02 }]) };
+    const baseline = plan({}, stored);
+    const next = plan(stored, incoming, baseline.nextState);
+    expect(next.mode).toBe("incremental");
+    expect(next.increments[date]?.tokens).toBe(0);
+    expect(next.increments[date]?.messages).toBe(1);
+    expect(next.increments[date]?.cost).toBeCloseTo(0.02, 4);
+    expect(next.nextState?.days[date]?.cost).toBeCloseTo(0.02, 4);
+    const replay = plan(next.nextState!.days, incoming, next.nextState);
+    expect(replay.mode).toBe("incremental");
+    expect(replay.increments).toEqual({});
+    expect(replay.nextState?.days[date]?.cost).toBeCloseTo(0.02, 4);
+  });
+
+  it("credits new tokenless cost during a preserving legacy transition", () => {
+    const stored = snapshot([{ date: "2025-04-14", messages: 1, cost: 0.02 }]);
+    const incoming = { ...stored, ...snapshot([{ messages: 1, cost: 0.03 }]) };
+    const next = plan(stored, incoming);
+    expect(next.mode).toBe("baseline-legacy");
+    expect(next.increments[date]?.cost).toBeCloseTo(0.03, 4);
+    expect(next.nextState?.days["2025-04-14"]?.cost).toBeCloseTo(0.02, 4);
+    const replay = plan(next.nextState!.days, incoming, next.nextState);
+    expect(replay.mode).toBe("incremental");
+    expect(replay.increments).toEqual({});
+    expect(replay.nextState?.days[date]?.cost).toBeCloseTo(0.03, 4);
+  });
+
+  it("bounds tokenless spend by the fraction of messages the day can credit", () => {
+    const stored = snapshot([
+      { messages: 1, cost: 1 },
+      { modelId: "gpt-4o", tokens: 100, messages: 1, cost: 1 },
+    ]);
+    const baseline = plan({}, stored);
+    const incoming = snapshot([{ messages: 3, cost: 3 }]);
+    const next = plan(stored, incoming, baseline.nextState);
+    // Two new premium calls are reported, but only one net new message can be
+    // proved for the day after the other model disappears: credit half of $2.
+    expect(next.increments[date]?.messages).toBe(1);
+    expect(next.increments[date]?.cost).toBeCloseTo(1, 4);
+    expect(next.nextState?.days[date]?.cost).toBeCloseTo(3, 4);
+    const replay = plan(next.nextState!.days, incoming, next.nextState);
+    expect(replay.mode).toBe("incremental");
+    expect(replay.increments).toEqual({});
+  });
+
+  it.each([
+    { client: "cursor", modelId: "auto" },
+    { client: "devin-cli", modelId: "premium-tool-call" },
+  ])(
+    "does not authorize tokenless cost for $client/$modelId",
+    ({ client, modelId }) => {
+      const stored = snapshot([{ modelId, messages: 1, cost: 1 }], client);
+      const baseline = plan({}, stored, undefined, client);
+      const next = plan(
+        stored,
+        snapshot([{ modelId, messages: 2, cost: 2 }], client),
+        baseline.nextState,
+        client,
+      );
+      expect(next.increments[date]?.messages).toBe(1);
+      expect(next.increments[date]?.cost).toBe(0);
+    },
+  );
+
+  it("does not authorize cost for repricing or rejected message growth", () => {
+    const stored = snapshot([{ messages: 2, cost: 1 }]);
+    const baseline = plan({}, stored);
+    for (const messages of [1, 2]) {
+      const next = plan(
+        stored,
+        snapshot([{ messages, cost: 2 }]),
+        baseline.nextState,
+      );
+      expect(next.mode).toBe("incremental");
+      expect(next.increments).toEqual({});
+      expect(next.nextState?.days[date]?.cost).toBe(1);
+    }
+  });
+
+  it("does not apply the tokenless exception to a previously token-bearing cell", () => {
+    const stored = snapshot([{ tokens: 100, messages: 1, cost: 1 }]);
+    const baseline = plan({}, stored);
+    const next = plan(
+      stored,
+      snapshot([{ messages: 2, cost: 2 }]),
+      baseline.nextState,
+    );
+    expect(next.increments[date]?.messages).toBe(1);
+    expect(next.increments[date]?.cost).toBe(0);
+  });
+
+  it("still prices token-bearing growth by accepted tokens rather than messages", () => {
+    const stored = snapshot([
+      { modelId: "gpt-4o", tokens: 100, messages: 1, cost: 1 },
+      { modelId: "other", tokens: 100, messages: 1, cost: 1 },
+    ]);
+    const baseline = plan({}, stored);
+    const next = plan(
+      stored,
+      snapshot([{ modelId: "gpt-4o", tokens: 250, messages: 2, cost: 4 }]),
+      baseline.nextState,
+    );
+    // One third of the model's 150-token capacity fits the day's 50-token
+    // budget; no message fits. The $3 marginal cost must still credit $1.
+    expect(next.increments[date]?.tokens).toBe(50);
+    expect(next.increments[date]?.messages).toBe(0);
+    expect(next.increments[date]?.cost).toBeCloseTo(1, 4);
+  });
+});
