@@ -860,12 +860,19 @@ function applyRecountProofToDays(
 }
 
 /**
- * Models whose cost no day's recount proof may move on this submit: those
- * the proof names on a day the snapshot could not price completely, or every
- * model the proof names once any of its days was rejected. A duplicate and
- * its survivor share a model, and every day holding either is a proof day for
- * that model, so a model outside this set has its survivors priced wherever
- * they lie.
+ * Models whose cost no day's recount proof may move on this submit.
+ *
+ * - Every model the proof names once any of its days was rejected.
+ * - Models the proof names on a day the snapshot could not price completely.
+ *   A duplicate usually shares its survivor's model, and every day holding
+ *   either is then a proof day for that model.
+ * - While any proof day is unpriced, models the proof shows with no survivor
+ *   on some day. Their duplicates' survivors lie on other days, possibly
+ *   under another model id (a Devin CLI copy without its generation model), so
+ *   no day's pricing can vouch for them alone.
+ *
+ * A model with survivors whose duplicates also have survivors on another,
+ * unpriced day under another model id cannot be told apart from the proof.
  */
 export function recountCostUnsafeModels(
   proof: ClientRecountProof,
@@ -873,17 +880,44 @@ export function recountCostUnsafeModels(
   costIncompleteDates: ReadonlySet<string>
 ): Set<string> {
   const unsafe = new Set<string>();
-  const dates =
-    recount.rejected.length > 0
-      ? Object.keys(proof)
-      : recount.accepted.filter((date) => costIncompleteDates.has(date));
-  for (const date of dates) {
+  if (recount.rejected.length > 0) {
+    for (const proofDay of Object.values(proof)) {
+      for (const modelId of Object.keys(proofDay)) unsafe.add(modelId);
+    }
+    return unsafe;
+  }
+  const unpricedDates = recount.accepted.filter((date) =>
+    costIncompleteDates.has(date)
+  );
+  if (unpricedDates.length === 0) return unsafe;
+  for (const date of unpricedDates) {
     for (const modelId of Object.keys(ownValue(proof, date) ?? {})) {
       unsafe.add(modelId);
     }
   }
+  for (const modelId of modelsWithoutSurvivors(proof, recount.accepted)) {
+    unsafe.add(modelId);
+  }
   return unsafe;
 }
+
+/** Models an accepted proof day lists with an empty corrected side. */
+function modelsWithoutSurvivors(
+  proof: ClientRecountProof,
+  dates: readonly string[]
+): Set<string> {
+  const models = new Set<string>();
+  for (const date of dates) {
+    for (const [modelId, entry] of Object.entries(ownValue(proof, date) ?? {})) {
+      const survives =
+        entry.corrected.messages > 0 ||
+        PROOF_TOKEN_FIELDS.some((field) => entry.corrected.tokens[field] > 0);
+      if (!survives) models.add(modelId);
+    }
+  }
+  return models;
+}
+
 
 function stateAfterCreditedIncrements(
   version: number,

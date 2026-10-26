@@ -1303,6 +1303,44 @@ describe("POST /api/submit devin-cli recount proof", () => {
     expect(cellOn("2026-10-09").provenance?.costIsComplete).toBeUndefined();
   });
 
+  it("keeps a duplicate-only model's cost while a survivor under another model is unpriced", async () => {
+    // Every swe-1-5 row on the 8th is a copy of a response whose survivor the
+    // corrected generation keeps on the 9th under swe-2-high. The 9th is
+    // unpriced, so the 8th keeps its $0.15 until it is.
+    const store = newStore();
+    seedDay(store, "2026-10-08", { "devin-cli": devinCell(100, 0.15, 1, "swe-1-5") });
+    const body = (ninthIsComplete: boolean) => {
+      const submission = submissionBody([
+        {
+          date: "2026-10-09",
+          tokens: 100,
+          cost: ninthIsComplete ? 0.15 : 0,
+          previous: { tokens: 100, cost: 0.15 },
+          provenCorrected: { tokens: 100, cost: 0.15 },
+        },
+      ]);
+      submission.contributions[0].totals.costIsComplete = ninthIsComplete;
+      const proofs = submission.scanScope.recountProofs!["devin-cli"] as Record<
+        string,
+        Record<string, { previous: ReturnType<typeof proofCell>; corrected: ReturnType<typeof proofCell> }>
+      >;
+      proofs["2026-10-08"] = {
+        "swe-1-5": { previous: proofCell(100, 0.15, 1), corrected: proofCell(0, 0, 0) },
+      };
+      return submission;
+    };
+
+    await submit(store, body(false));
+    const floored = store.days.find((day) => day.date === "2026-10-08")?.sourceBreakdown["devin-cli"];
+    expect(floored?.tokens).toBe(0);
+    expect(floored?.cost).toBeCloseTo(0.15, 4);
+    expect(floored?.provenance?.costIsComplete).toBe(false);
+
+    await submit(store, body(true));
+    expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBeUndefined();
+    expect(storedCost(store)).toBeCloseTo(0.15, 4);
+  });
+
   it("heals a stored day whose every row the corrected generation drops", async () => {
     const store = newStore();
     // Generation 1 dated 1,000 tokens on the 6th from rows that are all

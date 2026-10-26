@@ -2217,6 +2217,27 @@ describe("devin-cli recount proof", () => {
     ).toEqual(new Set(["swe-1-5", "swe-2-high"]));
   });
 
+  it("holds back a model without survivors while any proof day is unpriced", () => {
+    // swe-1-5's rows on the 8th are all duplicates; its survivor could be the
+    // 9th's swe-2-high (a copy that lost its generation model), and the 9th is
+    // unpriced. swe-1-5 never appears on the 9th, yet it waits too.
+    const proofOf = {
+      "2026-10-08": {
+        "swe-1-5": { previous: proofCell(100, 0.15), corrected: proofCell(0, 0, 0) },
+      },
+      "2026-10-09": {
+        "swe-2-high": { previous: proofCell(100, 0.15), corrected: proofCell(100, 0.15) },
+      },
+    };
+    const recount = { accepted: ["2026-10-08", "2026-10-09"], rejected: [] };
+
+    expect(recountCostUnsafeModels(proofOf, recount, new Set(["2026-10-09"]))).toEqual(
+      new Set(["swe-1-5", "swe-2-high"])
+    );
+    // With every day priced, nothing waits.
+    expect(recountCostUnsafeModels(proofOf, recount, new Set())).toEqual(new Set());
+  });
+
   it("reports the unsafe models in the plan and keeps their stored cost", () => {
     // The 8th's survivors are priced, but swe-2-high also appears on the
     // unpriced 9th, so its cost moves on neither day.
