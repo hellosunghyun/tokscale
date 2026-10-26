@@ -211,6 +211,12 @@ export interface ParserHighWaterPlan {
    * floored cost.
    */
   recountTransition?: boolean;
+  /**
+   * Models whose cost no proof day may move on this submit
+   * (`recountCostUnsafeModels`); the route passes them to
+   * `applyRecountProofToCell` as the planner did.
+   */
+  recountCostUnsafeModels?: string[];
   /** Days whose recount proof disagreed with the snapshot and was ignored. */
   rejectedRecountDays?: string[];
   nextState?: ParserClientHighWaterState;
@@ -623,11 +629,13 @@ export interface RecountProofContext {
    */
   storedCostIsFloor: boolean;
   /**
-   * Whether every day of the submission was priced completely. A model the
-   * snapshot does not submit on the day has rows that are all duplicates of
-   * survivors on other days, so only this vouches for their price.
+   * Models named by the proof on a day the snapshot could not price
+   * completely (all of them when the proof was rejected for some day). A
+   * duplicate's survivor can lie on another day (a response persisted across
+   * midnight), but always under the same model, so such a model's cost moves
+   * on no day: its survivors' price is not known (`recountCostUnsafeModels`).
    */
-  submissionCostIsComplete: boolean;
+  costUnsafeModels: ReadonlySet<string>;
 }
 
 /**
@@ -652,10 +660,10 @@ export interface RecountProofContext {
  *
  * Cost changes only on a complete snapshot, and only where the proof's
  * corrected cost is the cost the snapshot submitted for the model and the
- * previous cost accounts for the stored cost (within one stored cost unit). A
- * model the snapshot does not submit on the day (every row a duplicate of a
- * survivor on another day) has its cost changed only when the whole
- * submission was priced completely, since only then are those survivors.
+ * previous cost accounts for the stored cost (within one stored cost unit).
+ * A duplicate's survivor can lie on another day, so a model's cost moves only
+ * when every day the proof names that model on was priced completely
+ * (`RecountProofContext.costUnsafeModels`).
  * An incomplete snapshot keeps every stored cost as a floor: the CLI builds
  * the proof before submission zeroes estimates it cannot price safely, and an
  * unpriced survivor can make the corrected cost far too low. On those terms a
@@ -685,12 +693,8 @@ export function applyRecountProofToCell(
     const recount = context.transition && modelCountsEqual(model, entry.previous);
     const pricingVouches =
       context.costIsComplete &&
-      proofCostWasSubmitted(
-        entry,
-        submittedModels,
-        modelId,
-        context.submissionCostIsComplete
-      );
+      !context.costUnsafeModels.has(modelId) &&
+      proofCostWasSubmitted(entry, submittedModels, modelId);
     // A cost kept for want of complete pricing is a floor a later complete
     // proof restates. One kept because it exceeds what the previous
     // generation priced is spend the proof does not explain, and stays.
@@ -751,12 +755,7 @@ export function applyRecountProofToCell(
     cell,
     removed,
     changed,
-    costProven: recountProofProvesCost(
-      cell,
-      proofDay,
-      submitted,
-      context.submissionCostIsComplete
-    ),
+    costProven: recountProofProvesCost(cell, proofDay, submitted),
     costDeferred,
   };
 }
@@ -776,34 +775,24 @@ function submittedModelsOf(
 
 /**
  * Whether a proof's corrected cost for one model is the cost the snapshot
- * submitted for it (within one stored cost unit).
- *
- * A model the snapshot did not submit on the day (a day it does not date at
- * all, or a model whose rows there are all duplicates) has a corrected cost
- * of nothing. Its duplicates' survivors lie on other days, so that zero
- * counts only when the whole submission priced every token.
+ * submitted for it (within one stored cost unit). A model the snapshot did not
+ * submit on the day (a day it does not date at all, or a model whose rows
+ * there are all duplicates) submitted nothing.
  */
 function proofCostWasSubmitted(
   entry: RecountProofEntry,
   submittedModels: Record<string, ModelBreakdownData>,
-  modelId: string,
-  submissionCostIsComplete: boolean
+  modelId: string
 ): boolean {
-  const submittedModel = ownValue(submittedModels, modelId);
-  if (!submittedModel) {
-    return (
-      submissionCostIsComplete &&
-      Math.abs(entry.corrected.cost) <= PROOF_COST_TOLERANCE
-    );
-  }
-  return Math.abs(submittedModel.cost - entry.corrected.cost) <= PROOF_COST_TOLERANCE;
+  const submittedCost = ownValue(submittedModels, modelId)?.cost ?? 0;
+  return Math.abs(submittedCost - entry.corrected.cost) <= PROOF_COST_TOLERANCE;
 }
 
 /**
  * Whether a recount proof accounts for a stored cell's whole cost: every model
  * of the cell is named by the proof, with exactly its corrected counts and its
  * corrected cost (within one stored cost unit), and that cost is what the
- * snapshot submitted (`submitted`; see `proofCostWasSubmitted`).
+ * snapshot submitted (`submitted`).
  *
  * The route clears a floor tag only when this holds on a complete snapshot.
  * Equal counts alone would not be enough: another source's cell can hold the
@@ -812,8 +801,7 @@ function proofCostWasSubmitted(
 export function recountProofProvesCost(
   stored: ClientBreakdownData,
   proofDay: Record<string, RecountProofEntry>,
-  submitted: ClientBreakdownData | undefined,
-  submissionCostIsComplete: boolean
+  submitted: ClientBreakdownData | undefined
 ): boolean {
   const models = Object.entries(modelsForHighWater(stored));
   const submittedModels = submittedModelsOf(submitted);
@@ -826,7 +814,7 @@ export function recountProofProvesCost(
         proofCellIsOrdered(entry) &&
         modelCountsEqual(model, entry.corrected) &&
         Math.abs(model.cost - entry.corrected.cost) <= PROOF_COST_TOLERANCE &&
-        proofCostWasSubmitted(entry, submittedModels, modelId, submissionCostIsComplete)
+        proofCostWasSubmitted(entry, submittedModels, modelId)
       );
     })
   );
@@ -841,6 +829,7 @@ interface RecountDaysContext {
   costIncompleteDates: ReadonlySet<string>;
   /** The stored rows, whose floor tags decide `storedCostIsFloor`. */
   storedDays: Record<string, ClientBreakdownData>;
+  costUnsafeModels: ReadonlySet<string>;
 }
 
 function applyRecountProofToDays(
@@ -850,21 +839,50 @@ function applyRecountProofToDays(
   context: RecountDaysContext
 ): Record<string, ClientBreakdownData> {
   const next = normalizeStateDays(days);
-  const submissionCostIsComplete = context.costIncompleteDates.size === 0;
   for (const date of dates) {
     const stored = ownValue(next, date);
     const proofDay = ownValue(proof, date);
     if (!stored || !proofDay) continue;
-    const submitted = ownValue(context.submittedDays, date);
-    next[date] = applyRecountProofToCell(stored, proofDay, submitted, {
-      transition: context.transition,
-      costIsComplete: !context.costIncompleteDates.has(date),
-      storedCostIsFloor:
-        ownValue(context.storedDays, date)?.provenance?.costIsComplete === false,
-      submissionCostIsComplete,
-    }).cell;
+    next[date] = applyRecountProofToCell(
+      stored,
+      proofDay,
+      ownValue(context.submittedDays, date),
+      {
+        transition: context.transition,
+        costIsComplete: !context.costIncompleteDates.has(date),
+        storedCostIsFloor:
+          ownValue(context.storedDays, date)?.provenance?.costIsComplete === false,
+        costUnsafeModels: context.costUnsafeModels,
+      }
+    ).cell;
   }
   return next;
+}
+
+/**
+ * Models whose cost no day's recount proof may move on this submit: those
+ * the proof names on a day the snapshot could not price completely, or every
+ * model the proof names once any of its days was rejected. A duplicate and
+ * its survivor share a model, and every day holding either is a proof day for
+ * that model, so a model outside this set has its survivors priced wherever
+ * they lie.
+ */
+export function recountCostUnsafeModels(
+  proof: ClientRecountProof,
+  recount: { accepted: readonly string[]; rejected: readonly string[] },
+  costIncompleteDates: ReadonlySet<string>
+): Set<string> {
+  const unsafe = new Set<string>();
+  const dates =
+    recount.rejected.length > 0
+      ? Object.keys(proof)
+      : recount.accepted.filter((date) => costIncompleteDates.has(date));
+  for (const date of dates) {
+    for (const modelId of Object.keys(ownValue(proof, date) ?? {})) {
+      unsafe.add(modelId);
+    }
+  }
+  return unsafe;
 }
 
 function stateAfterCreditedIncrements(
@@ -1281,6 +1299,10 @@ export function planParserHighWaterSubmission(args: {
   const recount = proof
     ? partitionRecountProof(proof, args.incomingDays)
     : { accepted: [], rejected: [] };
+  const costIncompleteDates = args.costIncompleteDates ?? new Set<string>();
+  const costUnsafeModels = proof
+    ? recountCostUnsafeModels(proof, recount, costIncompleteDates)
+    : new Set<string>();
   const correctLedger = (
     days: Record<string, ClientBreakdownData>,
     transition: boolean
@@ -1289,14 +1311,18 @@ export function planParserHighWaterSubmission(args: {
       ? applyRecountProofToDays(days, proof, recount.accepted, {
           transition,
           submittedDays: args.incomingDays,
-          costIncompleteDates: args.costIncompleteDates ?? new Set<string>(),
+          costIncompleteDates,
           storedDays: args.existingLegacyDays,
+          costUnsafeModels,
         })
       : days;
   const recountFields = {
     ...(recount.accepted.length > 0 ? { recountDays: recount.accepted } : {}),
     ...(recount.rejected.length > 0
       ? { rejectedRecountDays: recount.rejected }
+      : {}),
+    ...(recount.accepted.length > 0 && costUnsafeModels.size > 0
+      ? { recountCostUnsafeModels: [...costUnsafeModels].sort() }
       : {}),
   };
   if (args.state == null || args.state.baselineEstablished === false) {

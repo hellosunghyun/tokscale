@@ -187,18 +187,13 @@ function expandDaysForReplaceLayouts(
 function expandDaysForRecountProofs(
   daysToProcess: Map<string, SubmissionData["contributions"][number]>,
   parserPlans: Map<string, ParserHighWaterPlan>,
-  existingDates: ReadonlySet<string>,
-  submissionCostIsComplete: boolean
+  existingDates: ReadonlySet<string>
 ): Set<string> {
   const proofOnlyDates = new Set<string>();
   for (const [, plan] of parserPlans) {
     for (const date of plan.recountDays ?? []) {
       if (!daysToProcess.has(date) && existingDates.has(date)) {
-        // The day's duplicates have survivors on other days, so its cost is
-        // only as complete as the whole submission's.
-        const day = emptyLayoutDay(date);
-        day.totals = { ...day.totals, costIsComplete: submissionCostIsComplete };
-        daysToProcess.set(date, day);
+        daysToProcess.set(date, emptyLayoutDay(date));
         proofOnlyDates.add(date);
       }
     }
@@ -1060,8 +1055,7 @@ export async function POST(request: Request) {
       for (const date of expandDaysForRecountProofs(
         daysToProcess,
         parserPlans,
-        new Set(existingDeviceDays.map((day) => day.date)),
-        costIncompleteDates.size === 0
+        new Set(existingDeviceDays.map((day) => day.date))
       )) {
         layoutOnlyDates.add(date);
       }
@@ -1224,7 +1218,7 @@ export async function POST(request: Request) {
                 transition: plan.recountTransition === true,
                 costIsComplete: incomingCostIsComplete,
                 storedCostIsFloor: stored.provenance?.costIsComplete === false,
-                submissionCostIsComplete: costIncompleteDates.size === 0,
+                costUnsafeModels: new Set(plan.recountCostUnsafeModels ?? []),
               }
             );
             if (incomingCostIsComplete && costProven) provenCostClients.add(client);
