@@ -1509,6 +1509,40 @@ describe("POST /api/submit cursor recount proof", () => {
     expect(store.device.parserVersions[CURSOR_RECOUNT_CASE.client]).toBe(2);
   });
 
+  it("keeps a corrected Cursor day when one of its accounts is logged out", async () => {
+    // Accounts A and B both used Cursor on 2026-10-08: 200 tokens each under
+    // generation 1, 100 each once snapshots are collapsed. The first
+    // generation-2 submit reads both caches and corrects the day to 200.
+    const store = newStore();
+    seedDay(store, "2026-10-08", {
+      [CURSOR_RECOUNT_CASE.client]: recountCell(400, 4, 4, CURSOR_RECOUNT_CASE.modelId),
+    });
+    const options = { recountClient: CURSOR_RECOUNT_CASE };
+    await submit(
+      store,
+      submissionBody(
+        [{ date: "2026-10-08", tokens: 200, cost: 2, messages: 2, previous: { tokens: 400, cost: 4, messages: 4 } }],
+        options,
+      ),
+    );
+    expect(storedClientTokens(store, "2026-10-08", CURSOR_RECOUNT_CASE.client)).toBe(200);
+
+    // `tokscale cursor logout` archives B's cache. A's proof still counts A's
+    // duplicates under generation 1, and its previous side (200 tokens, 2
+    // messages) equals the corrected day exactly; B's 100 must stay.
+    for (let replay = 0; replay < 2; replay += 1) {
+      await submit(
+        store,
+        submissionBody(
+          [{ date: "2026-10-08", tokens: 100, cost: 1, messages: 1, previous: { tokens: 200, cost: 2, messages: 2 } }],
+          options,
+        ),
+      );
+      expect(storedClientTokens(store, "2026-10-08", CURSOR_RECOUNT_CASE.client)).toBe(200);
+      expect(storedCost(store)).toBeCloseTo(2, 4);
+    }
+  });
+
   it("keeps crediting new Cursor usage after an account's cache is archived", async () => {
     // 2026-10-01 came from an account the user logged out of: its cache is
     // archived and no longer scanned. 2026-10-08 is the account still in use.
