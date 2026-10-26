@@ -1182,7 +1182,9 @@ export async function POST(request: Request) {
             if (!stored || !proofDay || !plan.recountDays?.includes(incomingDay.date)) {
               continue;
             }
-            const { cell, removed } = applyRecountProofToCell(stored, proofDay);
+            const { cell, removed } = applyRecountProofToCell(stored, proofDay, {
+              correctCounts: !plan.recountCostOnly,
+            });
             const increment = incomingClientBreakdown[client];
             recountedCells.set(
               client,

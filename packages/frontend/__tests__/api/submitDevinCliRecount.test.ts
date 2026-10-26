@@ -671,42 +671,68 @@ describe("POST /api/submit devin-cli recount proof", () => {
       expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBe(1_000);
     }
 
-    // When B is readable again (with 60 duplicates of its own) the proof
-    // covers both databases and the day heals to the truth.
-    await submit(
-      store,
+    // B is readable again (with 60 duplicates of its own), so the proof now
+    // covers both databases. The device is past its transition, and a later
+    // proof never lowers counts: the day stays as stored.
+    const bothDatabases = () =>
       submissionBody([
         { date: "2026-10-08", tokens: 890, cost: 0.89, previous: { tokens: 1_000, cost: 1 } },
-      ]),
-    );
-    expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBe(890);
-    expect(storedCost(store)).toBeCloseTo(0.89, 4);
+      ]);
+    await submit(store, bothDatabases());
+    expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBe(1_000);
+    expect(storedCost(store)).toBeCloseTo(1, 4);
+
+    // A device whose transition reads both databases heals the day then.
+    const healed = newStore();
+    seedDay(healed, "2026-10-08", { "devin-cli": devinCell(1_000, 1) });
+    await submit(healed, bothDatabases());
+    expect(storedClientTokens(healed, "2026-10-08", "devin-cli")).toBe(890);
+    expect(storedCost(healed)).toBeCloseTo(0.89, 4);
   });
 
   it("keeps a corrected day when one of its databases is later deleted", async () => {
-    // Databases A and B fed the stored day: 500 tokens under generation 1
+    // Databases A and B fed the stored day: 200 tokens under generation 1
     // from each, 100 under generation 2 from each. The first submit reads both.
     const store = newStore();
-    seedDay(store, "2026-10-08", { "devin-cli": devinCell(1_000, 1) });
+    seedDay(store, "2026-10-08", { "devin-cli": devinCell(400, 0.4) });
 
     await submit(
       store,
       submissionBody([
-        { date: "2026-10-08", tokens: 200, cost: 0.2, previous: { tokens: 1_000, cost: 1 } },
+        { date: "2026-10-08", tokens: 200, cost: 0.2, previous: { tokens: 400, cost: 0.4 } },
       ]),
     );
     expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBe(200);
 
-    // B is deleted. A's proof explains only A, and its previous count still
-    // includes A's duplicates; B's corrected 100 must stay.
+    // B is deleted. A's proof explains only A, yet its previous side (200
+    // tokens, 1 message) equals the corrected day exactly; B's 100 must stay.
     for (let replay = 0; replay < 2; replay += 1) {
       await submit(
         store,
         submissionBody([
-          { date: "2026-10-08", tokens: 100, cost: 0.1, previous: { tokens: 500, cost: 0.5 } },
+          { date: "2026-10-08", tokens: 100, cost: 0.1, previous: { tokens: 200, cost: 0.2 } },
         ]),
       );
       expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBe(200);
+      expect(storedCost(store)).toBeCloseTo(0.2, 4);
+    }
+  });
+
+  it("never lowers a complete cost whose counts only equal the corrected ones", async () => {
+    // The stored day holds database B's 100 tokens at $0.15. Database A's
+    // proof corrects 200 tokens to 100 at $0.10: the same counts, but nothing
+    // in it explains B's cost.
+    const store = newStore();
+    seedDay(store, "2026-10-08", { "devin-cli": devinCell(100, 0.15) });
+    for (let submitIndex = 0; submitIndex < 2; submitIndex += 1) {
+      await submit(
+        store,
+        submissionBody([
+          { date: "2026-10-08", tokens: 100, cost: 0.1, previous: { tokens: 200, cost: 0.2, messages: 2 } },
+        ]),
+      );
+      expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBe(100);
+      expect(storedCost(store)).toBeCloseTo(0.15, 4);
     }
   });
 

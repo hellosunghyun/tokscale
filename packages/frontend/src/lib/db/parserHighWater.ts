@@ -79,17 +79,15 @@ const SNAPSHOT_LAYOUT_CLIENTS: ReadonlySet<string> = new Set(["droid", "amp"]);
  * These clients therefore ship a per-day recount proof with every
  * full-history snapshot (`scanScope.recountProofs`): for each (day, model)
  * cell, what the previous generation counted from the same rows and what
- * this generation counts from them. A stored cell drops to the corrected
- * counts only when its token and message counts are exactly what the previous
- * generation counted from those rows. Any other stored cell may hold usage the
- * proof cannot describe: a source deleted or no longer cached locally, or a
- * cell already in this generation's units after an earlier correction, which
- * a source that later disappears would otherwise wear down. Such a cell is
- * kept exactly as it is. The correction runs on every submit and changes
- * nothing after the first application. A source that comes back unchanged
- * heals on the next complete snapshot whose previous counts match the stored
- * cell again, and a cost floored by an incomplete snapshot heals on the next
- * complete one.
+ * this generation counts from them. At the device's transition to the new
+ * generation, a stored cell drops to the corrected counts only when its token
+ * and message counts are exactly what the previous generation counted from
+ * those rows. Any other stored cell may hold usage the proof cannot describe
+ * (a source deleted or no longer cached locally) and is kept exactly as it
+ * is. After the transition a proof never lowers counts: the stored cells are
+ * then in this generation's units, and matching counts no longer show which
+ * rows they came from. A later proof may only finish a cost correction that
+ * an incomplete snapshot postponed.
  *
  * A non-fullHistory submit still freezes, so a partial scan never corrects
  * anything, and an empty snapshot keeps the transition pending rather than
@@ -193,11 +191,17 @@ export interface ParserHighWaterPlan {
   layoutDays?: Record<string, ClientBreakdownData>;
   /**
    * Days whose recount proof agrees with this snapshot. The credited ledger
-   * behind `nextState` already has the proven over-count subtracted on these
-   * days; the route applies `applyRecountProofToCell` to the stored cells of
-   * the same days before adding `increments`.
+   * behind `nextState` already has the proof applied on these days; the route
+   * applies `applyRecountProofToCell` to the stored cells of the same days,
+   * with the same `recountCostOnly`, before adding `increments`.
    */
   recountDays?: string[];
+  /**
+   * Set after the device's transition: the proof may only finish a cost
+   * correction that an incomplete snapshot postponed, and never lowers counts
+   * (`correctCounts: false`).
+   */
+  recountCostOnly?: boolean;
   /** Days whose recount proof disagreed with the snapshot and was ignored. */
   rejectedRecountDays?: string[];
   nextState?: ParserClientHighWaterState;
@@ -596,58 +600,63 @@ export interface RecountCorrection {
   removed: { tokens: number; cost: number; messages: number };
 }
 
+export interface RecountCorrectionOptions {
+  /**
+   * Whether the proof may lower token and message counts. Only a device's
+   * transition to the recounting generation may (see `applyRecountProofToCell`).
+   */
+  correctCounts: boolean;
+}
+
 /**
  * Apply one day's recount proof to a stored cell.
  *
- * Per model, a stored cell whose token and message counts equal exactly what
- * the previous generation counted from the proof's rows drops to the
- * corrected counts; any other stored cell is kept. Equality, not
- * `stored <= previous`, is the evidence. Once a cell has been corrected, or
- * credited by this generation, it is in this generation's units while
- * `previous` still counts the duplicates, so a smaller cell proves nothing
- * about where its usage came from. This is what makes it safe to run on every
- * submit and against any stored cell:
+ * Counts are corrected only at the device's transition to the recounting
+ * generation (`correctCounts`), while every stored cell still holds what the
+ * previous generation counted. There, per model, a stored cell whose token
+ * and message counts equal exactly what the previous generation counts from
+ * the proof's rows drops to the corrected counts, and its cost drops to the
+ * corrected cost if the previous cost accounts for it (within one stored cost
+ * unit). Any other cell is kept as stored. It holds usage the proof cannot
+ * describe (a source deleted or no longer cached locally), or rows that
+ * changed after its last submit (usually the last day submitted before the
+ * upgrade). The proof's other side already passes the same test: its
+ * corrected counts must equal the submitted cell
+ * (`recountProofDayMatchesSnapshot`).
  *
- * - a cell already at the corrected counts loses nothing (idempotent);
- * - a cell carrying usage the proof never saw (a source deleted or no longer
- *   cached locally, before or after an earlier correction) is kept whole;
- * - a cell BELOW the corrected count (new usage not yet credited) is left for
- *   the bounded-growth allocation to raise, never lowered;
- * - a source that becomes readable again enlarges the proof; once its
- *   previous counts match the stored cell, the cell drops to the corrected
- *   counts then.
+ * After the transition, a stored cell is in this generation's units
+ * (corrected, credited by this generation, or kept), and the receiver keeps
+ * no record of which rows it came from. Matching counts prove nothing then.
+ * When one of two sources disappears, the remaining source's previous count
+ * can equal the corrected day exactly, and lowering the day would erase the
+ * other source. So a later proof never lowers counts, and replaying a proof
+ * changes nothing.
  *
- * Cost follows the counts. When they are corrected, or already equal the
- * corrected counts, the stored cost drops to the corrected cost if the
- * previous cost accounts for it (within one stored cost unit). The second
- * case is how a cost floored by an incomplete snapshot is corrected later.
- *
- * The proof's other side already passes the same test: its corrected counts
- * must equal the submitted cell (`recountProofDayMatchesSnapshot`).
- *
- * The price of equality: a stored cell whose rows changed after it was
- * submitted no longer matches its previous count and is not corrected. This is
- * usually the last day submitted before the upgrade, which can gain rows after
- * that submit. It stays as stored rather than risk removing usage the proof
- * cannot see.
+ * In both phases a proof may finish a cost correction that an incomplete
+ * snapshot postponed. A cell tagged `costIsComplete: false` whose counts equal
+ * the corrected counts takes the corrected cost on the same terms. A complete
+ * cost is never lowered this way, because equal counts alone do not show that
+ * the cost came from the proof's rows.
  *
  * Models the proof does not name are untouched; proof models the cell does
  * not hold have nothing to correct.
  */
 export function applyRecountProofToCell(
   stored: ClientBreakdownData,
-  proofDay: Record<string, RecountProofEntry>
+  proofDay: Record<string, RecountProofEntry>,
+  options: RecountCorrectionOptions
 ): RecountCorrection {
   const models = modelsForHighWater(stored);
   const removed = { tokens: 0, cost: 0, messages: 0 };
+  const costIsFloor = stored.provenance?.costIsComplete === false;
   for (const [modelId, entry] of Object.entries(proofDay)) {
     const model = ownValue(models, modelId);
     if (!model || !proofCellIsOrdered(entry)) continue;
     const countsEqual = (side: RecountProofCell) =>
       PROOF_TOKEN_FIELDS.every((field) => model[field] === side.tokens[field]) &&
       model.messages === side.messages;
-    const recount = countsEqual(entry.previous);
-    if (!recount && !countsEqual(entry.corrected)) continue;
+    const recount = options.correctCounts && countsEqual(entry.previous);
+    if (!recount && !(costIsFloor && countsEqual(entry.corrected))) continue;
     const next = { ...model };
     if (recount) {
       const priorInclusiveInput = positive(
@@ -697,14 +706,15 @@ export function applyRecountProofToCell(
 function applyRecountProofToDays(
   days: Record<string, ClientBreakdownData>,
   proof: ClientRecountProof,
-  dates: readonly string[]
+  dates: readonly string[],
+  options: RecountCorrectionOptions
 ): Record<string, ClientBreakdownData> {
   const next = normalizeStateDays(days);
   for (const date of dates) {
     const stored = ownValue(next, date);
     const proofDay = ownValue(proof, date);
     if (!stored || !proofDay) continue;
-    next[date] = applyRecountProofToCell(stored, proofDay).cell;
+    next[date] = applyRecountProofToCell(stored, proofDay, options).cell;
   }
   return next;
 }
@@ -1105,11 +1115,11 @@ export function planParserHighWaterSubmission(args: {
   if (args.state && !validState(args.state, supportedVersion)) {
     return { mode: "freeze", increments: {} };
   }
-  // A recount proof corrects the credited ledger BEFORE growth is allocated
-  // against it, in both the transition and the incremental branch. The
-  // snapshot then raises any cell the correction left below it, bounded as
-  // ever by provable lifetime growth, so a corrected cell converges on the
-  // truth from either side.
+  // A recount proof is applied to the credited ledger BEFORE growth is
+  // allocated against it. At the transition it corrects counts; afterwards it
+  // may only finish a postponed cost correction. The snapshot then raises any
+  // cell left below it, bounded as ever by provable growth, so a corrected
+  // cell converges on the truth from either side.
   const proof = RECOUNT_PROOF_CLIENTS.has(args.client)
     ? args.recountProof
     : undefined;
@@ -1117,10 +1127,11 @@ export function planParserHighWaterSubmission(args: {
     ? partitionRecountProof(proof, args.incomingDays)
     : { accepted: [], rejected: [] };
   const correctLedger = (
-    days: Record<string, ClientBreakdownData>
+    days: Record<string, ClientBreakdownData>,
+    options: RecountCorrectionOptions
   ): Record<string, ClientBreakdownData> =>
     proof && recount.accepted.length > 0
-      ? applyRecountProofToDays(days, proof, recount.accepted)
+      ? applyRecountProofToDays(days, proof, recount.accepted, options)
       : days;
   const recountFields = {
     ...(recount.accepted.length > 0 ? { recountDays: recount.accepted } : {}),
@@ -1129,7 +1140,11 @@ export function planParserHighWaterSubmission(args: {
       : {}),
   };
   if (args.state == null || args.state.baselineEstablished === false) {
-    const existingLegacyDays = correctLedger(args.existingLegacyDays);
+    // Every stored cell still holds what the previous generation counted, so
+    // this is the one submit whose proof may lower counts.
+    const existingLegacyDays = correctLedger(args.existingLegacyDays, {
+      correctCounts: true,
+    });
     const legacyAggregate = aggregateSnapshot(existingLegacyDays);
     const hasLegacy =
       legacyAggregate.tokens > 0 || legacyAggregate.messages > 0;
@@ -1200,10 +1215,13 @@ export function planParserHighWaterSubmission(args: {
   // maximum and advanced its aggregate even when no cell could accept that
   // growth. Rebuild that one-time migration baseline from the rows that were
   // actually credited, otherwise already-suppressed usage remains lost.
+  // After the transition a proof never lowers counts (see
+  // `applyRecountProofToCell`); it may only finish a postponed cost correction.
   const previousCreditedDays = correctLedger(
     args.state.stateVersion === PARSER_HIGH_WATER_STATE_VERSION
       ? args.state.days
-      : args.existingLegacyDays
+      : args.existingLegacyDays,
+    { correctCounts: false }
   );
   // A v2 aggregate must describe exactly the credited cells (see validState),
   // so once a correction touched them it is re-derived rather than reused.
@@ -1246,6 +1264,7 @@ export function planParserHighWaterSubmission(args: {
       args.incomingDays
     ),
     ...recountFields,
+    ...(recount.accepted.length > 0 ? { recountCostOnly: true } : {}),
   };
 }
 
