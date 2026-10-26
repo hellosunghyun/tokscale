@@ -1508,4 +1508,33 @@ describe("POST /api/submit cursor recount proof", () => {
     }
     expect(store.device.parserVersions[CURSOR_RECOUNT_CASE.client]).toBe(2);
   });
+
+  it("keeps crediting new Cursor usage after an account's cache is archived", async () => {
+    // 2026-10-01 came from an account the user logged out of: its cache is
+    // archived and no longer scanned. 2026-10-08 is the account still in use.
+    const store = newStore();
+    seedDay(store, "2026-10-01", {
+      [CURSOR_RECOUNT_CASE.client]: recountCell(5_000, 50, 10, CURSOR_RECOUNT_CASE.modelId),
+    });
+    seedDay(store, "2026-10-08", {
+      [CURSOR_RECOUNT_CASE.client]: recountCell(1_000, 10, 4, CURSOR_RECOUNT_CASE.modelId),
+    });
+    const options = { recountClient: CURSOR_RECOUNT_CASE };
+    const inUse = { date: "2026-10-08", tokens: 400, cost: 4, messages: 1, previous: { tokens: 1_000, cost: 10, messages: 4 } };
+
+    await submit(store, submissionBody([inUse], options));
+    expect(storedClientTokens(store, "2026-10-08", CURSOR_RECOUNT_CASE.client)).toBe(400);
+    expect(storedClientTokens(store, "2026-10-01", CURSOR_RECOUNT_CASE.client)).toBe(5_000);
+
+    const json = await submit(
+      store,
+      submissionBody([inUse, { date: "2026-10-09", tokens: 300, cost: 3, messages: 1 }], options),
+    );
+    expect(storedClientTokens(store, "2026-10-09", CURSOR_RECOUNT_CASE.client)).toBe(300);
+    expect(storedClientTokens(store, "2026-10-08", CURSOR_RECOUNT_CASE.client)).toBe(400);
+    expect(storedClientTokens(store, "2026-10-01", CURSOR_RECOUNT_CASE.client)).toBe(5_000);
+    expect(
+      (json.warnings ?? []).some((warning: string) => warning.includes("Added no Cursor tokens")),
+    ).toBe(false);
+  });
 });

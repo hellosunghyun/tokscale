@@ -111,6 +111,29 @@ const RECOUNT_PROOF_CLIENTS: ReadonlySet<string> = new Set([
   "devin-cli",
 ]);
 
+/**
+ * Recounting clients whose generations only drop rows the previous generation
+ * counted and never move usage to another day: Cursor generation 2 keeps one
+ * snapshot of each event, on a day where generation 1 already counted it.
+ *
+ * The lifetime budget below exists so that usage a generation re-dates cannot
+ * be credited twice. Under it, history that leaves the local scan
+ * (`tokscale cursor logout` archives that account's cache, and the scanner
+ * skips archives) would stop every later token from counting until the
+ * archived total was earned again. These clients budget growth per day
+ * instead: a day's token and message totals may rise to the snapshot's totals
+ * for that day and never above them, as they could under the ordinary per-day
+ * merge before registration. Costs and token buckets are attributed as for
+ * every versioned client, and only the recount proof at the device's
+ * transition lowers a stored day.
+ *
+ * This relies on each Cursor event keeping its timestamp across snapshots, as
+ * the snapshots of a real profile do (#1544). An event whose later snapshot
+ * moved to another day after the transition would be credited on both days,
+ * as the ordinary per-day merge did.
+ */
+const PER_DAY_GROWTH_CLIENTS: ReadonlySet<string> = new Set(["cursor"]);
+
 /** One (day, model) cell as a parser generation counts it. */
 export interface RecountProofCell {
   tokens: {
@@ -991,20 +1014,39 @@ function tokenCandidates(
   return candidates;
 }
 
+/** A day's token and message totals as the ledger and the route normalize it. */
+function normalizedDayTotals(day: ClientBreakdownData | undefined): {
+  tokens: number;
+  messages: number;
+} {
+  let tokens = 0;
+  let messages = 0;
+  for (const model of Object.values(modelsForHighWater(day))) {
+    tokens += model.tokens;
+    messages += model.messages;
+  }
+  return { tokens, messages };
+}
+
 function allocateIncrements(
   previousCreditedDays: Record<string, ClientBreakdownData>,
   previousObservedDays: Record<string, ClientBreakdownData>,
   incomingDays: Record<string, ClientBreakdownData>,
   previousAggregate: ParserAggregateHighWater,
-  incomingAggregate: ParserAggregateHighWater
+  incomingAggregate: ParserAggregateHighWater,
+  growth: "lifetime" | "per-day" = "lifetime"
 ): Record<string, ClientBreakdownData> {
+  const perDay = growth === "per-day";
   // Keep the complete credited lifetime in the budget. A client-reported
   // retention boundary cannot prove that a missing old cell was pruned rather
   // than re-dated into this snapshot, so excluding it could credit it twice.
-  let tokenBudget = positive(incomingAggregate.tokens - previousAggregate.tokens);
-  let messageBudget = positive(
-    incomingAggregate.messages - previousAggregate.messages
-  );
+  // PER_DAY_GROWTH_CLIENTS never re-date, so their budget is per day instead.
+  let tokenBudget = perDay
+    ? Number.POSITIVE_INFINITY
+    : positive(incomingAggregate.tokens - previousAggregate.tokens);
+  let messageBudget = perDay
+    ? Number.POSITIVE_INFINITY
+    : positive(incomingAggregate.messages - previousAggregate.messages);
   // Per-cell capacity below still reads the FULL credited ledger, so a
   // re-reported day cannot be credited twice.
   const previousObservedAggregate = aggregateSnapshot(previousObservedDays);
@@ -1017,6 +1059,21 @@ function allocateIncrements(
   const dates = Object.keys(incomingDays).sort((a, b) =>
     a === b ? 0 : a < b ? 1 : -1
   );
+  // Per-day growth: a day's token and message totals rise at most to the
+  // snapshot's totals for it. Bounding the day, not each model, also keeps
+  // usage that a later scan names under another model id from counting twice.
+  // Totals come from the normalized models the route adds increments to, so a
+  // legacy cell whose nested models exceed its scalar cannot be overfilled.
+  const dayTokenBudgets = createSafeRecord<number>();
+  const dayMessageBudgets = createSafeRecord<number>();
+  for (const date of perDay ? dates : []) {
+    const credited = normalizedDayTotals(ownValue(previousCreditedDays, date));
+    const incoming = normalizedDayTotals(incomingDays[date]);
+    dayTokenBudgets[date] = positive(incoming.tokens - credited.tokens);
+    dayMessageBudgets[date] = positive(incoming.messages - credited.messages);
+  }
+  const dayBudget = (budgets: Record<string, number>, date: string) =>
+    perDay ? ownValue(budgets, date) ?? 0 : Number.POSITIVE_INFINITY;
   const cells = dates.flatMap((date) => {
     const incoming = incomingDays[date];
     const creditedModels = modelsForHighWater(
@@ -1087,13 +1144,15 @@ function allocateIncrements(
           candidates[field],
           tokenBudget,
           cellBudget,
-          respectBucketBudgets ? bucketBudgets[field] : Number.POSITIVE_INFINITY
+          respectBucketBudgets ? bucketBudgets[field] : Number.POSITIVE_INFINITY,
+          dayBudget(dayTokenBudgets, cell.date)
         );
         cell.increment[field] += accepted;
         cell.increment.tokens += accepted;
         tokenBudget -= accepted;
         cellBudget -= accepted;
         if (respectBucketBudgets) bucketBudgets[field] -= accepted;
+        if (perDay) dayTokenBudgets[cell.date] -= accepted;
       }
     }
   };
@@ -1136,10 +1195,12 @@ function allocateIncrements(
       const accepted = Math.min(
         positive(candidateFor(cell)),
         messageBudget,
-        cellBudget
+        cellBudget,
+        dayBudget(dayMessageBudgets, cell.date)
       );
       cell.increment.messages += accepted;
       messageBudget -= accepted;
+      if (perDay) dayMessageBudgets[cell.date] -= accepted;
     }
   };
 
@@ -1234,6 +1295,8 @@ function validState(
  * with uncredited capacity receives the bounded remainder. Only increments
  * actually written advance the credited ledger, so growth cannot be lost.
  * Date/model reshuffles and deleted local history never erase stored rows.
+ * PER_DAY_GROWTH_CLIENTS bound that growth per day instead of by the lifetime
+ * high-water, because their generations never re-date usage.
  *
  * SNAPSHOT_LAYOUT_CLIENTS are the deliberate exception to both absolutes
  * above: once a full snapshot's aggregate covers the credited one, the stored
@@ -1335,6 +1398,7 @@ export function planParserHighWaterSubmission(args: {
   // provable growth, so a corrected cell converges on the truth from either
   // side. After the transition it can only restate a floored cost (see
   // `applyRecountProofToCell`).
+  const growth = PER_DAY_GROWTH_CLIENTS.has(args.client) ? "per-day" : "lifetime";
   const proof = RECOUNT_PROOF_CLIENTS.has(args.client)
     ? args.recountProof
     : undefined;
@@ -1416,7 +1480,8 @@ export function planParserHighWaterSubmission(args: {
           existingLegacyDays,
           args.incomingDays,
           legacyAggregate,
-          incomingAggregate
+          incomingAggregate,
+          growth
         )
       : createSafeRecord<ClientBreakdownData>();
     const nextState = hasLegacy
@@ -1475,12 +1540,16 @@ export function planParserHighWaterSubmission(args: {
     previousObservedDays,
     args.incomingDays,
     previousAggregate,
-    incomingAggregate
+    incomingAggregate,
+    growth
   );
 
-  const highWaterDeficit = positive(
-    previousAggregate.tokens - incomingAggregate.tokens
-  );
+  // Only a lifetime budget withholds growth while the scan sits below the
+  // credited baseline; per-day growth has no such deficit to report.
+  const highWaterDeficit =
+    growth === "lifetime"
+      ? positive(previousAggregate.tokens - incomingAggregate.tokens)
+      : 0;
   return {
     mode: "incremental",
     increments,

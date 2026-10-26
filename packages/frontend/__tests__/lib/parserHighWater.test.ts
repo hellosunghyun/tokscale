@@ -2614,6 +2614,142 @@ describe("cursor recount proof rollout", () => {
     expect(followed.nextState?.days["2026-10-08"]?.tokens).toBe(400);
   });
 
+  it("keeps crediting new usage after local Cursor history shrinks", () => {
+    // `tokscale cursor logout` archives that account's cache and the scanner
+    // skips archives, so later scans no longer carry its days. The stored
+    // days stay, and new usage from the account still in use must count.
+    const stored = cursorSnapshot(
+      cursorContribution("2026-10-01", 5_000, 50, 10),
+      cursorContribution("2026-10-08", 400, 4, 1)
+    );
+    const transition = cursorPlan({ existing: stored, incoming: corrected });
+    expect(transition.mode).toBe("baseline-legacy");
+    expect(transition.nextState?.days["2026-10-01"]?.tokens).toBe(5_000);
+
+    const grown = cursorPlan({
+      existing: {},
+      incoming: cursorSnapshot(
+        cursorContribution("2026-10-08", 450, 4.5, 2),
+        cursorContribution("2026-10-09", 300, 3, 1)
+      ),
+      state: transition.nextState,
+    });
+    expect(grown.mode).toBe("incremental");
+    expect(grown.highWaterDeficit).toBeUndefined();
+    expect(grown.increments["2026-10-08"]?.tokens).toBe(50);
+    expect(grown.increments["2026-10-08"]?.messages).toBe(1);
+    expect(grown.increments["2026-10-09"]?.tokens).toBe(300);
+    expect(grown.nextState?.days["2026-10-01"]?.tokens).toBe(5_000);
+    expect(grown.nextState?.aggregate.tokens).toBe(5_750);
+  });
+
+  it("credits a day only up to its snapshot total when its model ids change", () => {
+    const stored = cursorSnapshot(cursorContribution("2026-10-08", 400, 4, 1));
+    const state = cursorPlan({ existing: stored, incoming: stored }).nextState!;
+    // The same day under another model id: per-model capacity alone would
+    // credit it a second time.
+    const renamed = foldParserClientSnapshot(
+      [
+        {
+          date: "2026-10-08",
+          clients: [
+            {
+              client,
+              modelId: "gemini-4-argon",
+              tokens: { input: 450, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+              cost: 4.5,
+              messages: 2,
+            },
+          ],
+        },
+      ],
+      client
+    );
+
+    const plan = cursorPlan({ existing: {}, incoming: renamed, state });
+    expect(plan.increments["2026-10-08"]?.tokens).toBe(50);
+    expect(plan.increments["2026-10-08"]?.messages).toBe(1);
+    expect(plan.nextState?.aggregate.tokens).toBe(450);
+  });
+
+  it("budgets a day from the normalized totals the route writes", () => {
+    // A legacy cell whose nested models (200) exceed its scalar total (100).
+    // The route adds increments to the normalized models, so a budget taken
+    // from the scalar would let the day end above the snapshot's 150.
+    const nested = cursorSnapshot(cursorContribution("2026-10-08", 200, 2, 2))["2026-10-08"];
+    const overRepresented: ClientBreakdownData = {
+      ...nested,
+      tokens: 100,
+      input: 100,
+      messages: 1,
+    };
+    const archived = cursorSnapshot(cursorContribution("2026-10-01", 1_000, 10, 4));
+    const renamed = foldParserClientSnapshot(
+      [
+        {
+          date: "2026-10-08",
+          clients: [
+            {
+              client,
+              modelId: "gemini-4-argon",
+              tokens: { input: 150, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+              cost: 1.5,
+              messages: 2,
+            },
+          ],
+        },
+      ],
+      client
+    );
+
+    const plan = cursorPlan({
+      existing: { ...archived, "2026-10-08": overRepresented },
+      incoming: renamed,
+    });
+    expect(plan.mode).toBe("baseline-legacy");
+    expect(plan.increments["2026-10-08"]).toBeUndefined();
+  });
+
+  it("zeroes a moved snapshot's earlier day only at the transition", () => {
+    // One event whose later snapshot carries the next day's timestamp. Real
+    // Cursor snapshots keep their event's timestamp (#1544); if one did not,
+    // generation 1 would count both days while the cache holds both rows, and
+    // the proof would show the earlier day's row as a duplicate.
+    const moved: ClientRecountProof = {
+      "2026-10-08": {
+        [modelId]: { previous: cursorProofCell(100, 1, 1), corrected: cursorProofCell(0, 0, 0) },
+      },
+      "2026-10-09": {
+        [modelId]: { previous: cursorProofCell(110, 1.1, 1), corrected: cursorProofCell(110, 1.1, 1) },
+      },
+    };
+    const day9 = cursorSnapshot(cursorContribution("2026-10-09", 110, 1.1, 1));
+
+    // At the transition both stored days hold generation-1 counts, so the
+    // proof zeroes the earlier one.
+    const transition = cursorPlan({
+      existing: {
+        ...cursorSnapshot(cursorContribution("2026-10-08", 100, 1, 1)),
+        ...day9,
+      },
+      incoming: day9,
+      recountProof: moved,
+    });
+    expect(transition.recountDays).toEqual(["2026-10-08", "2026-10-09"]);
+    expect(transition.nextState?.days["2026-10-08"]?.tokens ?? 0).toBe(0);
+    expect(transition.nextState?.days["2026-10-09"]?.tokens).toBe(110);
+
+    // After the transition a proof never lowers counts, so a snapshot that
+    // moves later is credited on both days, as the ordinary merge did.
+    const day8 = cursorSnapshot(cursorContribution("2026-10-08", 100, 1, 1));
+    const state = cursorPlan({ existing: day8, incoming: day8 }).nextState!;
+    const later = cursorPlan({ existing: {}, incoming: day9, state, recountProof: moved });
+    expect(later.recountTransition).toBeUndefined();
+    expect(later.nextState?.days["2026-10-08"]?.tokens).toBe(100);
+    expect(later.nextState?.days["2026-10-09"]?.tokens).toBe(110);
+    expect(later.nextState?.aggregate.tokens).toBe(210);
+  });
+
   it("keeps an empty full-history snapshot pending", () => {
     const empty = cursorPlan({ existing: inflated, incoming: {} });
 

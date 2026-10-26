@@ -916,7 +916,7 @@ export async function POST(request: Request) {
         const label = ownValue(SOURCE_DISPLAY_NAMES, client) ?? client;
         if (plan.mode === "baseline-legacy") {
           warnings.push(
-            `Established the ${label} parser generation ${supportedVersion} baseline; existing same-device history was preserved and only bounded lifetime growth was added.`
+            `Established the ${label} parser generation ${supportedVersion} baseline; existing same-device history was preserved and only bounded growth was added.`
           );
         } else if (plan.mode === "replace") {
           warnings.push(
