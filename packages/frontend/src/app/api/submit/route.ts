@@ -1189,6 +1189,9 @@ export async function POST(request: Request) {
           // Clients whose whole cost a complete proof accounts for, so an
           // earlier floor tag may clear.
           const provenCostClients = new Set<string>();
+          // Clients whose recounted cost was kept for want of complete
+          // pricing: their cell is a floor whatever this day's pricing.
+          const deferredCostClients = new Set<string>();
           const incomingCostIsComplete =
             incomingDay.totals?.costIsComplete ?? true;
           for (const [client, plan] of plannedIncrementClients) {
@@ -1213,7 +1216,7 @@ export async function POST(request: Request) {
               foldParserClientSnapshot([incomingDay], client),
               incomingDay.date
             );
-            const { cell, removed, changed, costProven } = applyRecountProofToCell(
+            const { cell, removed, changed, costProven, costDeferred } = applyRecountProofToCell(
               stored,
               proofDay,
               submitted,
@@ -1225,6 +1228,7 @@ export async function POST(request: Request) {
               }
             );
             if (incomingCostIsComplete && costProven) provenCostClients.add(client);
+            if (costDeferred) deferredCostClients.add(client);
             if (!changed) continue;
             const increment = incomingClientBreakdown[client];
             recountedCells.set(
@@ -1284,13 +1288,15 @@ export async function POST(request: Request) {
           }
           const mergedClientBreakdown = mergeResult.merged;
           for (const [client, cell] of recountedCells) {
-            // The corrected amounts are written as they are: on an incomplete
-            // snapshot the proof left every stored cost in place as a floor.
-            // The cell is tagged as a floor when this snapshot is incomplete,
-            // or when it was tagged before and the proof does not account for
-            // its whole cost.
+            // The corrected amounts are written as they are: where pricing
+            // could not vouch for the proof's cost, the stored cost was left in
+            // place as a floor. The cell is tagged as a floor when this
+            // snapshot is incomplete, when such a cost was kept, or when it was
+            // tagged before and the proof does not account for its whole
+            // cost.
             const keepsFloor =
               !incomingCostIsComplete ||
+              deferredCostClients.has(client) ||
               (ownValue(existingClientBreakdown, client)?.provenance
                 ?.costIsComplete === false &&
                 !provenCostClients.has(client));

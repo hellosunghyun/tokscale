@@ -1192,6 +1192,61 @@ describe("POST /api/submit devin-cli recount proof", () => {
     expect(ledger().days["2026-10-08"]?.cost ?? 0).toBeCloseTo(0, 4);
   });
 
+  it("tags a kept duplicate cost as a floor when its survivor's day is not priced", async () => {
+    // On the 8th, swe-2-high has survivors there; every swe-1-5 row is a
+    // duplicate of a survivor dated the 9th, which this submission could not
+    // price. The 8th itself is priced completely.
+    const store = newStore();
+    seedDay(store, "2026-10-08", {
+      "devin-cli": {
+        tokens: 300,
+        cost: 0.35,
+        input: 300,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        messages: 2,
+        models: {
+          "swe-2-high": devinCell(200, 0.2).models["swe-2-high"],
+          "swe-1-5": devinCell(100, 0.15, 1, "swe-1-5").models["swe-1-5"],
+        },
+      },
+    });
+    const body = (ninthIsComplete: boolean) => {
+      const submission = submissionBody([
+        { date: "2026-10-08", tokens: 100, cost: 0.1, previous: { tokens: 200, cost: 0.2 } },
+        { date: "2026-10-09", tokens: 50, cost: 0.05, previous: { tokens: 50, cost: 0.05 } },
+      ]);
+      submission.contributions[1].totals.costIsComplete = ninthIsComplete;
+      const proofDay8 = submission.scanScope.recountProofs!["devin-cli"]["2026-10-08"] as Record<
+        string,
+        { previous: ReturnType<typeof proofCell>; corrected: ReturnType<typeof proofCell> }
+      >;
+      proofDay8["swe-1-5"] = { previous: proofCell(100, 0.15, 1), corrected: proofCell(0, 0, 0) };
+      return submission;
+    };
+    const day8 = () => store.days.find((day) => day.date === "2026-10-08")!.sourceBreakdown["devin-cli"];
+
+    await submit(store, body(false));
+    // swe-1-5's counts go; its $0.15 stays, tagged, until its survivor's
+    // price is known.
+    expect(day8().tokens).toBe(100);
+    expect(day8().models["swe-1-5"].tokens).toBe(0);
+    expect(day8().models["swe-1-5"].cost).toBeCloseTo(0.15, 4);
+    expect(day8().cost).toBeCloseTo(0.25, 4);
+    expect(day8().provenance?.costIsComplete).toBe(false);
+    const ledger = store.device.parserStates["devin-cli"] as ParserClientHighWaterState;
+    expect(ledger.days["2026-10-08"]?.cost).toBeCloseTo(0.25, 4);
+
+    // A submission that prices every day restates the floor and clears it.
+    await submit(store, body(true));
+    expect(day8().tokens).toBe(100);
+    expect(day8().cost).toBeCloseTo(0.1, 4);
+    expect(day8().provenance?.costIsComplete).toBeUndefined();
+    expect(storedCost(store)).toBeCloseTo(0.15, 4);
+  });
+
   it("heals a stored day whose every row the corrected generation drops", async () => {
     const store = newStore();
     // Generation 1 dated 1,000 tokens on the 6th from rows that are all

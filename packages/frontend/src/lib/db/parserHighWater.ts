@@ -599,6 +599,12 @@ export interface RecountCorrection {
    * `recountProofProvesCost`.
    */
   costProven: boolean;
+  /**
+   * Whether a model's counts were corrected while its cost was kept because
+   * pricing could not vouch for the proof's cost. That cost is a floor: the
+   * route tags the cell, and a later complete proof restates it.
+   */
+  costDeferred: boolean;
 }
 
 /** What `applyRecountProofToCell` needs to know about the submit. */
@@ -672,22 +678,28 @@ export function applyRecountProofToCell(
   const submittedModels = submittedModelsOf(submitted);
   const removed = { tokens: 0, cost: 0, messages: 0 };
   let changed = false;
+  let costDeferred = false;
   for (const [modelId, entry] of Object.entries(proofDay)) {
     const model = ownValue(models, modelId);
     if (!model || !proofCellIsOrdered(entry)) continue;
     const recount = context.transition && modelCountsEqual(model, entry.previous);
-    // Stored and proof costs are sums of the same per-message prices and can
-    // differ by floating-point noise, so a stored cost up to one stored cost
-    // unit above `previous` still counts as accounted for.
-    const costAccountedFor =
+    const pricingVouches =
       context.costIsComplete &&
       proofCostWasSubmitted(
         entry,
         submittedModels,
         modelId,
         context.submissionCostIsComplete
-      ) &&
-      model.cost <= entry.previous.cost + PROOF_COST_TOLERANCE;
+      );
+    // A cost kept for want of complete pricing is a floor a later complete
+    // proof restates. One kept because it exceeds what the previous
+    // generation priced is spend the proof does not explain, and stays.
+    costDeferred ||= recount && !pricingVouches;
+    // Stored and proof costs are sums of the same per-message prices and can
+    // differ by floating-point noise, so a stored cost up to one stored cost
+    // unit above `previous` still counts as accounted for.
+    const costAccountedFor =
+      pricingVouches && model.cost <= entry.previous.cost + PROOF_COST_TOLERANCE;
     const restatesFloor =
       context.storedCostIsFloor &&
       costAccountedFor &&
@@ -745,6 +757,7 @@ export function applyRecountProofToCell(
       submitted,
       context.submissionCostIsComplete
     ),
+    costDeferred,
   };
 }
 
