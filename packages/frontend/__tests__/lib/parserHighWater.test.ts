@@ -1740,6 +1740,75 @@ describe("devin-cli recount proof", () => {
     expect(second.nextState?.aggregate.tokens).toBe(890);
   });
 
+  it("keeps a corrected day when one of its sources later disappears", () => {
+    // Databases A and B fed the stored day: generation 1 counted 500 from
+    // each and generation 2 counts 100 from each. The first full snapshot
+    // reads both and corrects the day to 200.
+    const stored = devinSnapshot(devinContribution("2026-10-08", 1_000, "swe-2-high", 0, 4));
+    const first = devinPlan(
+      stored,
+      devinSnapshot(devinContribution("2026-10-08", 200, "swe-2-high", 0, 2)),
+      {
+        recountProof: proof({
+          "2026-10-08": { previous: proofCell(1_000, 0, 4), corrected: proofCell(200, 0, 2) },
+        }),
+      }
+    );
+    expect(first.nextState?.days["2026-10-08"]?.tokens).toBe(200);
+
+    // B is then deleted. A's proof still counts A's duplicates under
+    // generation 1, so its previous count (500) is above the corrected day,
+    // but the day is already in generation-2 units and B's 100 must stay.
+    const afterDelete = devinPlan(
+      {},
+      devinSnapshot(devinContribution("2026-10-08", 100, "swe-2-high", 0, 1)),
+      {
+        state: first.nextState,
+        recountProof: proof({
+          "2026-10-08": { previous: proofCell(500, 0, 2), corrected: proofCell(100, 0, 1) },
+        }),
+      }
+    );
+    expect(afterDelete.nextState?.days["2026-10-08"]?.tokens).toBe(200);
+    expect(afterDelete.nextState?.days["2026-10-08"]?.messages).toBe(2);
+  });
+
+  it("never lowers a day first credited by this generation when a source disappears", () => {
+    // The day was never stored under generation 1: this generation credited
+    // 200 from A and B. A's later proof explains only A.
+    const state = devinPlan(
+      {},
+      devinSnapshot(devinContribution("2026-10-08", 200, "swe-2-high", 0, 2))
+    ).nextState!;
+    const afterDelete = devinPlan(
+      {},
+      devinSnapshot(devinContribution("2026-10-08", 100, "swe-2-high", 0, 1)),
+      {
+        state,
+        recountProof: proof({
+          "2026-10-08": { previous: proofCell(500, 0, 2), corrected: proofCell(100, 0, 1) },
+        }),
+      }
+    );
+    expect(afterDelete.nextState?.days["2026-10-08"]?.tokens).toBe(200);
+  });
+
+  it("keeps a legacy day whose remaining source has since outgrown it", () => {
+    // The stored 400 came from A (200) and B (200) under generation 1. B is
+    // gone by the first generation-2 scan and A has grown to 500. A's proof
+    // counts more than the stored day, yet none of B's share is in it, so
+    // the day is kept rather than lowered to A's corrected 150. (A day that
+    // only grew from one source looks the same and stays inflated too.)
+    const stored = devinSnapshot(devinContribution("2026-10-08", 400));
+    const plan = devinPlan(stored, devinSnapshot(devinContribution("2026-10-08", 150)), {
+      recountProof: proof({
+        "2026-10-08": { previous: proofCell(500), corrected: proofCell(150) },
+      }),
+    });
+    expect(plan.recountDays).toEqual(["2026-10-08"]);
+    expect(plan.nextState?.days["2026-10-08"]?.tokens).toBe(400);
+  });
+
   it("never lowers a cell below the corrected count and lets growth raise it", () => {
     // Stored 1,000 = 900 real + 100 duplicate rows. Since then 180 new tokens
     // arrived whose rows carry 20 duplicates of their own. The proven

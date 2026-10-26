@@ -683,6 +683,33 @@ describe("POST /api/submit devin-cli recount proof", () => {
     expect(storedCost(store)).toBeCloseTo(0.89, 4);
   });
 
+  it("keeps a corrected day when one of its databases is later deleted", async () => {
+    // Databases A and B fed the stored day: 500 tokens under generation 1
+    // from each, 100 under generation 2 from each. The first submit reads both.
+    const store = newStore();
+    seedDay(store, "2026-10-08", { "devin-cli": devinCell(1_000, 1) });
+
+    await submit(
+      store,
+      submissionBody([
+        { date: "2026-10-08", tokens: 200, cost: 0.2, previous: { tokens: 1_000, cost: 1 } },
+      ]),
+    );
+    expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBe(200);
+
+    // B is deleted. A's proof explains only A, and its previous count still
+    // includes A's duplicates; B's corrected 100 must stay.
+    for (let replay = 0; replay < 2; replay += 1) {
+      await submit(
+        store,
+        submissionBody([
+          { date: "2026-10-08", tokens: 100, cost: 0.1, previous: { tokens: 500, cost: 0.5 } },
+        ]),
+      );
+      expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBe(200);
+    }
+  });
+
   it("keeps generation-1 submissions compatible before the transition", async () => {
     const store = newStore();
     seedInflatedDays(store);
