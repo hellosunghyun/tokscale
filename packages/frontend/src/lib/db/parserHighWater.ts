@@ -598,6 +598,12 @@ export interface RecountCorrection {
   cell: ClientBreakdownData;
   /** What the correction removed from the stored cell. */
   removed: { tokens: number; cost: number; messages: number };
+  /**
+   * Which of the stored cell's models the proof restated. "all" means the
+   * cell's whole cost now rests on the proof; "none" means the cell is
+   * returned unchanged.
+   */
+  restated: "all" | "some" | "none";
 }
 
 export interface RecountCorrectionOptions {
@@ -649,6 +655,7 @@ export function applyRecountProofToCell(
   const models = modelsForHighWater(stored);
   const removed = { tokens: 0, cost: 0, messages: 0 };
   const costIsFloor = stored.provenance?.costIsComplete === false;
+  let restatedModels = 0;
   for (const [modelId, entry] of Object.entries(proofDay)) {
     const model = ownValue(models, modelId);
     if (!model || !proofCellIsOrdered(entry)) continue;
@@ -690,6 +697,7 @@ export function applyRecountProofToCell(
     );
     removed.cost += model.cost - next.cost;
     models[modelId] = next;
+    restatedModels += 1;
   }
   const cell = breakdownFromModels(models);
   // Re-derive provenance from the corrected totals, carrying the stored
@@ -700,7 +708,13 @@ export function applyRecountProofToCell(
     provenance: stored.provenance,
   });
   removed.cost = quantizeCost(removed.cost);
-  return { cell, removed };
+  const restated =
+    restatedModels === 0
+      ? "none"
+      : restatedModels === Object.keys(models).length
+        ? "all"
+        : "some";
+  return { cell, removed, restated };
 }
 
 function applyRecountProofToDays(

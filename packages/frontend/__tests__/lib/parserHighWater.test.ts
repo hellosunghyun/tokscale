@@ -2030,6 +2030,7 @@ describe("devin-cli recount proof", () => {
     })["2026-10-08"];
 
     const after = applyRecountProofToCell(corrected, proofDay, AFTER_TRANSITION);
+    expect(after.restated).toBe("none");
     expect(after.cell.tokens).toBe(200);
     expect(after.cell.messages).toBe(2);
     expect(after.cell.cost).toBeCloseTo(0.2, 4);
@@ -2037,6 +2038,7 @@ describe("devin-cli recount proof", () => {
 
     // At the transition the same counts are generation-1 counts and match.
     const atTransition = applyRecountProofToCell(corrected, proofDay, AT_TRANSITION);
+    expect(atTransition.restated).toBe("all");
     expect(atTransition.cell.tokens).toBe(100);
   });
 
@@ -2054,14 +2056,31 @@ describe("devin-cli recount proof", () => {
     // A complete cost with the corrected counts may belong to other rows (a
     // source the proof does not describe), so it is never lowered.
     const complete = applyRecountProofToCell(cell(0.15), proofDay, AFTER_TRANSITION);
+    expect(complete.restated).toBe("none");
     expect(complete.cell.cost).toBeCloseTo(0.15, 4);
     expect(applyRecountProofToCell(cell(0.15), proofDay, AT_TRANSITION).cell.cost).toBeCloseTo(0.15, 4);
 
     // A floor an incomplete snapshot left behind takes the corrected cost.
     const floor = applyRecountProofToCell(cell(0.15, false), proofDay, AFTER_TRANSITION);
+    expect(floor.restated).toBe("all");
     expect(floor.cell.cost).toBeCloseTo(0.1, 4);
     expect(floor.cell.tokens).toBe(100);
     expect(floor.removed).toEqual({ tokens: 0, cost: 0.05, messages: 0 });
+  });
+
+  it("reports a cell the proof restates only in part", () => {
+    const stored = devinSnapshot(
+      devinContribution("2026-10-08", 200, "swe-2-high", 0.2, 2),
+      devinContribution("2026-10-08", 50, "swe-1-5", 0.05, 1)
+    )["2026-10-08"];
+    const proofDay = proof({
+      "2026-10-08": { previous: proofCell(200, 0.2, 2), corrected: proofCell(100, 0.1, 1) },
+    })["2026-10-08"];
+
+    const partly = applyRecountProofToCell(stored, proofDay, AT_TRANSITION);
+    expect(partly.restated).toBe("some");
+    expect(partly.cell.models["swe-2-high"].tokens).toBe(100);
+    expect(partly.cell.models["swe-1-5"].tokens).toBe(50);
   });
 
   it("keeps generation-1 submissions compatible before the transition", () => {

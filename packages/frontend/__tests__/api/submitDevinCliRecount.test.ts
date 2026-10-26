@@ -736,6 +736,66 @@ describe("POST /api/submit devin-cli recount proof", () => {
     }
   });
 
+  it("keeps the floor tag on a stored day the proof does not restate", async () => {
+    // The stored day's $1.00 is a floor, and the proof explains only one of
+    // the databases behind it, so the day is kept and its cost is still only
+    // a lower bound after a complete snapshot.
+    const store = newStore();
+    const floored = devinCell(1_000, 1);
+    floored.provenance = { schemaVersion: 1, messageCount: 1, modelCount: 1, costIsComplete: false };
+    seedDay(store, "2026-10-08", { "devin-cli": floored });
+
+    await submit(
+      store,
+      submissionBody([
+        { date: "2026-10-08", tokens: 350, cost: 0.35, previous: { tokens: 400, cost: 0.4 } },
+      ]),
+    );
+
+    const cell = store.days.find((day) => day.date === "2026-10-08")!.sourceBreakdown["devin-cli"];
+    expect(cell.tokens).toBe(1_000);
+    expect(cell.cost).toBeCloseTo(1, 4);
+    expect(cell.provenance?.costIsComplete).toBe(false);
+  });
+
+  it("keeps the floor tag on a cell the proof restates only in part", async () => {
+    // swe-2-high already holds its corrected counts, and its $0.30 is a floor
+    // an incomplete snapshot left behind. swe-1-5 is not in the proof.
+    const store = newStore();
+    seedDay(store, "2026-10-08", {
+      "devin-cli": {
+        tokens: 150,
+        cost: 0.5,
+        input: 150,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        messages: 2,
+        models: {
+          "swe-2-high": devinCell(100, 0.3).models["swe-2-high"],
+          "swe-1-5": devinCell(50, 0.2, 1, "swe-1-5").models["swe-1-5"],
+        },
+        provenance: { schemaVersion: 1, messageCount: 2, modelCount: 2, costIsComplete: false },
+      },
+    });
+
+    await submit(
+      store,
+      submissionBody([
+        { date: "2026-10-08", tokens: 100, cost: 0.1, previous: { tokens: 200, cost: 0.3 } },
+      ]),
+    );
+
+    // The complete proof restates swe-2-high's cost, but says nothing about
+    // swe-1-5's, so the cell keeps its floor tag.
+    const cell = store.days.find((day) => day.date === "2026-10-08")!.sourceBreakdown["devin-cli"];
+    expect(cell.models["swe-2-high"].cost).toBeCloseTo(0.1, 4);
+    expect(cell.models["swe-1-5"].cost).toBeCloseTo(0.2, 4);
+    expect(cell.tokens).toBe(150);
+    expect(cell.provenance?.costIsComplete).toBe(false);
+  });
+
   it("keeps generation-1 submissions compatible before the transition", async () => {
     const store = newStore();
     seedInflatedDays(store);

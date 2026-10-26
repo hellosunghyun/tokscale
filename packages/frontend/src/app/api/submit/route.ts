@@ -1163,8 +1163,11 @@ export async function POST(request: Request) {
           // increment is then added on top of the corrected cell, exactly as
           // the planner credited it. The corrected cell is written directly
           // after the merge: it is lower than the stored one by design, which
-          // the regression guard would otherwise refuse.
+          // the regression guard would otherwise refuse. A cell the proof left
+          // unchanged takes the ordinary increment path instead, which keeps
+          // its cost-completeness tag.
           const recountedCells = new Map<string, ClientBreakdownData>();
+          const partlyRestatedClients = new Set<string>();
           const incomingCostIsComplete =
             incomingDay.totals?.costIsComplete ?? true;
           for (const [client, plan] of plannedIncrementClients) {
@@ -1182,9 +1185,11 @@ export async function POST(request: Request) {
             if (!stored || !proofDay || !plan.recountDays?.includes(incomingDay.date)) {
               continue;
             }
-            const { cell, removed } = applyRecountProofToCell(stored, proofDay, {
+            const { cell, removed, restated } = applyRecountProofToCell(stored, proofDay, {
               correctCounts: !plan.recountCostOnly,
             });
+            if (restated === "none") continue;
+            if (restated === "some") partlyRestatedClients.add(client);
             const increment = incomingClientBreakdown[client];
             recountedCells.set(
               client,
@@ -1244,17 +1249,29 @@ export async function POST(request: Request) {
           }
           const mergedClientBreakdown = mergeResult.merged;
           for (const [client, cell] of recountedCells) {
-            // The proof restates the whole cell's cost, so a complete snapshot
-            // clears an earlier floor exactly, the documented rule for a
-            // complete write. An incomplete one may still only raise cost:
-            // the stored (pre-correction) model costs stay as floors and the
-            // cell stays tagged, and the cost correction lands on the first
-            // complete snapshot of the same layout.
+            // When the proof restates the whole cell's cost, a complete
+            // snapshot clears an earlier floor exactly, the documented rule for
+            // a complete write. A model the proof did not restate keeps its
+            // floor, so a partly restated cell stays tagged. An incomplete
+            // snapshot may still only raise cost: the stored (pre-correction)
+            // model costs stay as floors and the cell stays tagged, and the
+            // cost correction lands on the first complete snapshot of the same
+            // layout.
+            const storedCell = ownValue(existingClientBreakdown, client);
             const written = applyCostCompleteness(
               cell,
-              ownValue(existingClientBreakdown, client),
+              storedCell,
               incomingCostIsComplete
             );
+            if (
+              partlyRestatedClients.has(client) &&
+              storedCell?.provenance?.costIsComplete === false
+            ) {
+              written.provenance = {
+                ...deriveClientBreakdownProvenance(written),
+                costIsComplete: false,
+              };
+            }
             // A cell the proof empties entirely (every stored row was a
             // duplicate) leaves nothing to keep; dropping it lets an
             // otherwise empty day row go with it below.
