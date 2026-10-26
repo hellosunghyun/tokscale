@@ -1262,8 +1262,12 @@ export function planParserHighWaterSubmission(args: {
     // this is the one submit whose proof may correct counts.
     const existingLegacyDays = correctLedger(args.existingLegacyDays, true);
     const legacyAggregate = aggregateSnapshot(existingLegacyDays);
+    // Whether the device stored anything is judged before the proof: a stored
+    // row the proof empties entirely still has to be corrected by the route,
+    // which only a legacy baseline does.
+    const storedAggregate = aggregateSnapshot(args.existingLegacyDays);
     const hasLegacy =
-      legacyAggregate.tokens > 0 || legacyAggregate.messages > 0;
+      storedAggregate.tokens > 0 || storedAggregate.messages > 0;
     if (hasLegacy) {
       // Tried before the preserving transition below, so a snapshot-layout
       // client adopts the snapshot's own dating instead of preserving legacy

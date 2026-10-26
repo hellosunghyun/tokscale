@@ -191,8 +191,6 @@ function expandDaysForRecountProofs(
 ): Set<string> {
   const proofOnlyDates = new Set<string>();
   for (const [, plan] of parserPlans) {
-    // Only the transition's proof can change a stored cell.
-    if (!plan.recountTransition) continue;
     for (const date of plan.recountDays ?? []) {
       if (!daysToProcess.has(date) && existingDates.has(date)) {
         daysToProcess.set(date, emptyLayoutDay(date));

@@ -1132,6 +1132,60 @@ describe("POST /api/submit devin-cli recount proof", () => {
     expect(cell.provenance?.costIsComplete).toBeUndefined();
   });
 
+  it("corrects a device's only stored day when every row on it is a duplicate", async () => {
+    // The device stored only the 8th. Its rows are all duplicates of a
+    // response the corrected generation dates on the 9th, which the device
+    // never stored. With the 8th emptied no stored usage is left, but the
+    // stored row still has to go, or the 9th would count it a second time.
+    const store = newStore();
+    seedDay(store, "2026-10-08", { "devin-cli": devinCell(100, 0.1) });
+    const body = (tokens: number) =>
+      submissionBody(
+        [{ date: "2026-10-09", tokens, cost: tokens / 1000, previous: { tokens, cost: tokens / 1000 } }],
+        { allDuplicateDays: [{ date: "2026-10-08", previous: { tokens: 100, cost: 0.1 } }] },
+      );
+
+    await submit(store, body(50));
+    expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBeUndefined();
+    expect(storedClientTokens(store, "2026-10-09", "devin-cli")).toBe(50);
+    const ledger = store.device.parserStates["devin-cli"] as ParserClientHighWaterState;
+    expect(ledger.aggregate.tokens).toBe(50);
+
+    // Later growth on the 9th is credited once.
+    await submit(store, body(150));
+    expect(storedTokens(store)).toBe(150);
+    expect(storedCost(store)).toBeCloseTo(0.15, 4);
+  });
+
+  it("drops a duplicate day's cost with its rows even on an incomplete transition", async () => {
+    // As above, but the snapshot could not price every token. The emptied day
+    // has no submitted rows at all, and its stored counts are exactly the
+    // duplicates the proof names, so its whole cost goes with them; only the
+    // 9th's cost is a floor.
+    const store = newStore();
+    seedDay(store, "2026-10-08", { "devin-cli": devinCell(100, 0.1) });
+
+    await submit(
+      store,
+      submissionBody(
+        [{ date: "2026-10-09", tokens: 50, cost: 0.05, previous: { tokens: 50, cost: 0.05 } }],
+        {
+          costIsComplete: false,
+          allDuplicateDays: [{ date: "2026-10-08", previous: { tokens: 100, cost: 0.1 } }],
+        },
+      ),
+    );
+
+    expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBeUndefined();
+    expect(storedTokens(store)).toBe(50);
+    expect(storedCost(store)).toBeCloseTo(0.05, 4);
+    const ledger = store.device.parserStates["devin-cli"] as ParserClientHighWaterState;
+    expect(ledger.aggregate.tokens).toBe(50);
+    expect(ledger.days["2026-10-08"]?.cost ?? 0).toBeCloseTo(0, 4);
+    const day9 = store.days.find((day) => day.date === "2026-10-09")!.sourceBreakdown["devin-cli"];
+    expect(day9.provenance?.costIsComplete).toBe(false);
+  });
+
   it("heals a stored day whose every row the corrected generation drops", async () => {
     const store = newStore();
     // Generation 1 dated 1,000 tokens on the 6th from rows that are all
