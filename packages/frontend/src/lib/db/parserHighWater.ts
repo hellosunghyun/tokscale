@@ -616,6 +616,12 @@ export interface RecountProofContext {
    * stored row, because its own ledger does not keep the tag.
    */
   storedCostIsFloor: boolean;
+  /**
+   * Whether every day of the submission was priced completely. A model the
+   * snapshot does not submit on the day has rows that are all duplicates of
+   * survivors on other days, so only this vouches for their price.
+   */
+  submissionCostIsComplete: boolean;
 }
 
 /**
@@ -640,7 +646,10 @@ export interface RecountProofContext {
  *
  * Cost changes only on a complete snapshot, and only where the proof's
  * corrected cost is the cost the snapshot submitted for the model and the
- * previous cost accounts for the stored cost (within one stored cost unit).
+ * previous cost accounts for the stored cost (within one stored cost unit). A
+ * model the snapshot does not submit on the day (every row a duplicate of a
+ * survivor on another day) has its cost changed only when the whole
+ * submission was priced completely, since only then are those survivors.
  * An incomplete snapshot keeps every stored cost as a floor: the CLI builds
  * the proof before submission zeroes estimates it cannot price safely, and an
  * unpriced survivor can make the corrected cost far too low. On those terms a
@@ -672,7 +681,12 @@ export function applyRecountProofToCell(
     // unit above `previous` still counts as accounted for.
     const costAccountedFor =
       context.costIsComplete &&
-      proofCostWasSubmitted(entry, submittedModels, modelId) &&
+      proofCostWasSubmitted(
+        entry,
+        submittedModels,
+        modelId,
+        context.submissionCostIsComplete
+      ) &&
       model.cost <= entry.previous.cost + PROOF_COST_TOLERANCE;
     const restatesFloor =
       context.storedCostIsFloor &&
@@ -725,7 +739,12 @@ export function applyRecountProofToCell(
     cell,
     removed,
     changed,
-    costProven: recountProofProvesCost(cell, proofDay, submitted),
+    costProven: recountProofProvesCost(
+      cell,
+      proofDay,
+      submitted,
+      context.submissionCostIsComplete
+    ),
   };
 }
 
@@ -744,23 +763,34 @@ function submittedModelsOf(
 
 /**
  * Whether a proof's corrected cost for one model is the cost the snapshot
- * submitted for it (within one stored cost unit). A day the snapshot does not
- * date submitted nothing.
+ * submitted for it (within one stored cost unit).
+ *
+ * A model the snapshot did not submit on the day (a day it does not date at
+ * all, or a model whose rows there are all duplicates) has a corrected cost
+ * of nothing. Its duplicates' survivors lie on other days, so that zero
+ * counts only when the whole submission priced every token.
  */
 function proofCostWasSubmitted(
   entry: RecountProofEntry,
   submittedModels: Record<string, ModelBreakdownData>,
-  modelId: string
+  modelId: string,
+  submissionCostIsComplete: boolean
 ): boolean {
-  const submittedCost = ownValue(submittedModels, modelId)?.cost ?? 0;
-  return Math.abs(submittedCost - entry.corrected.cost) <= PROOF_COST_TOLERANCE;
+  const submittedModel = ownValue(submittedModels, modelId);
+  if (!submittedModel) {
+    return (
+      submissionCostIsComplete &&
+      Math.abs(entry.corrected.cost) <= PROOF_COST_TOLERANCE
+    );
+  }
+  return Math.abs(submittedModel.cost - entry.corrected.cost) <= PROOF_COST_TOLERANCE;
 }
 
 /**
  * Whether a recount proof accounts for a stored cell's whole cost: every model
  * of the cell is named by the proof, with exactly its corrected counts and its
  * corrected cost (within one stored cost unit), and that cost is what the
- * snapshot submitted (`submitted`).
+ * snapshot submitted (`submitted`; see `proofCostWasSubmitted`).
  *
  * The route clears a floor tag only when this holds on a complete snapshot.
  * Equal counts alone would not be enough: another source's cell can hold the
@@ -769,7 +799,8 @@ function proofCostWasSubmitted(
 export function recountProofProvesCost(
   stored: ClientBreakdownData,
   proofDay: Record<string, RecountProofEntry>,
-  submitted: ClientBreakdownData | undefined
+  submitted: ClientBreakdownData | undefined,
+  submissionCostIsComplete: boolean
 ): boolean {
   const models = Object.entries(modelsForHighWater(stored));
   const submittedModels = submittedModelsOf(submitted);
@@ -782,7 +813,7 @@ export function recountProofProvesCost(
         proofCellIsOrdered(entry) &&
         modelCountsEqual(model, entry.corrected) &&
         Math.abs(model.cost - entry.corrected.cost) <= PROOF_COST_TOLERANCE &&
-        proofCostWasSubmitted(entry, submittedModels, modelId)
+        proofCostWasSubmitted(entry, submittedModels, modelId, submissionCostIsComplete)
       );
     })
   );
@@ -806,21 +837,19 @@ function applyRecountProofToDays(
   context: RecountDaysContext
 ): Record<string, ClientBreakdownData> {
   const next = normalizeStateDays(days);
+  const submissionCostIsComplete = context.costIncompleteDates.size === 0;
   for (const date of dates) {
     const stored = ownValue(next, date);
     const proofDay = ownValue(proof, date);
     if (!stored || !proofDay) continue;
-    next[date] = applyRecountProofToCell(
-      stored,
-      proofDay,
-      ownValue(context.submittedDays, date),
-      {
-        transition: context.transition,
-        costIsComplete: !context.costIncompleteDates.has(date),
-        storedCostIsFloor:
-          ownValue(context.storedDays, date)?.provenance?.costIsComplete === false,
-      }
-    ).cell;
+    const submitted = ownValue(context.submittedDays, date);
+    next[date] = applyRecountProofToCell(stored, proofDay, submitted, {
+      transition: context.transition,
+      costIsComplete: !context.costIncompleteDates.has(date),
+      storedCostIsFloor:
+        ownValue(context.storedDays, date)?.provenance?.costIsComplete === false,
+      submissionCostIsComplete,
+    }).cell;
   }
   return next;
 }

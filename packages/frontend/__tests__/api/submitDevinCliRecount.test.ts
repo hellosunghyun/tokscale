@@ -1157,33 +1157,39 @@ describe("POST /api/submit devin-cli recount proof", () => {
     expect(storedCost(store)).toBeCloseTo(0.15, 4);
   });
 
-  it("drops a duplicate day's cost with its rows even on an incomplete transition", async () => {
-    // As above, but the snapshot could not price every token. The emptied day
-    // has no submitted rows at all, and its stored counts are exactly the
-    // duplicates the proof names, so its whole cost goes with them; only the
-    // 9th's cost is a floor.
+  it("keeps a duplicate day's cost as a floor until the whole submission is priced", async () => {
+    // As above, but the 9th could not be priced, and the older CLI priced the
+    // 8th's rows at $0.15 (the proof's own estimate says $0.20). Their
+    // survivor's price is unknown, so the emptied 8th keeps its cost as a
+    // floor.
     const store = newStore();
-    seedDay(store, "2026-10-08", { "devin-cli": devinCell(100, 0.1) });
-
-    await submit(
-      store,
+    seedDay(store, "2026-10-08", { "devin-cli": devinCell(100, 0.15) });
+    const body = (costIsComplete: boolean) =>
       submissionBody(
         [{ date: "2026-10-09", tokens: 50, cost: 0.05, previous: { tokens: 50, cost: 0.05 } }],
         {
-          costIsComplete: false,
-          allDuplicateDays: [{ date: "2026-10-08", previous: { tokens: 100, cost: 0.1 } }],
+          costIsComplete,
+          allDuplicateDays: [{ date: "2026-10-08", previous: { tokens: 100, cost: 0.2 } }],
         },
-      ),
-    );
+      );
+    const ledger = () => store.device.parserStates["devin-cli"] as ParserClientHighWaterState;
 
+    await submit(store, body(false));
+    const floored = store.days.find((day) => day.date === "2026-10-08")?.sourceBreakdown["devin-cli"];
+    expect(floored?.tokens).toBe(0);
+    expect(floored?.messages).toBe(0);
+    expect(floored?.cost).toBeCloseTo(0.15, 4);
+    expect(floored?.provenance?.costIsComplete).toBe(false);
+    expect(ledger().aggregate.tokens).toBe(50);
+    expect(ledger().days["2026-10-08"]?.cost ?? 0).toBeCloseTo(0.15, 4);
+
+    // Once every day is priced, the survivors carry the cost and the floor
+    // goes with the emptied day.
+    await submit(store, body(true));
     expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBeUndefined();
     expect(storedTokens(store)).toBe(50);
     expect(storedCost(store)).toBeCloseTo(0.05, 4);
-    const ledger = store.device.parserStates["devin-cli"] as ParserClientHighWaterState;
-    expect(ledger.aggregate.tokens).toBe(50);
-    expect(ledger.days["2026-10-08"]?.cost ?? 0).toBeCloseTo(0, 4);
-    const day9 = store.days.find((day) => day.date === "2026-10-09")!.sourceBreakdown["devin-cli"];
-    expect(day9.provenance?.costIsComplete).toBe(false);
+    expect(ledger().days["2026-10-08"]?.cost ?? 0).toBeCloseTo(0, 4);
   });
 
   it("heals a stored day whose every row the corrected generation drops", async () => {

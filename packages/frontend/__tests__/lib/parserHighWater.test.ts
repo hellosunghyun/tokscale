@@ -116,7 +116,12 @@ function expectCreditedNothing(plan: ParserHighWaterPlan) {
 
 
 /** `applyRecountProofToCell` contexts used below. */
-const AT_TRANSITION = { transition: true, costIsComplete: true, storedCostIsFloor: false } as const;
+const AT_TRANSITION = {
+  transition: true,
+  costIsComplete: true,
+  storedCostIsFloor: false,
+  submissionCostIsComplete: true,
+} as const;
 const AT_TRANSITION_FLOOR = { ...AT_TRANSITION, storedCostIsFloor: true } as const;
 describe("non-destructive parser generation high-water", () => {
   it("treats prototype-named model IDs as ordinary untrusted keys", () => {
@@ -2029,6 +2034,7 @@ describe("devin-cli recount proof", () => {
     const incomplete = applyRecountProofToCell(stored, proofDay, submitted, {
       ...AT_TRANSITION_FLOOR,
       costIsComplete: false,
+      submissionCostIsComplete: false,
     });
     expect(incomplete.cell.tokens).toBe(1_200);
     expect(incomplete.cell.cost).toBeCloseTo(30, 4);
@@ -2059,18 +2065,18 @@ describe("devin-cli recount proof", () => {
     const cell = (tokens: number, cost: number) =>
       devinSnapshot(devinContribution("2026-10-08", tokens, "swe-2-high", cost, 1))["2026-10-08"];
 
-    expect(recountProofProvesCost(cell(100, 0.1), proofDay, submittedFor(proofDay))).toBe(true);
+    expect(recountProofProvesCost(cell(100, 0.1), proofDay, submittedFor(proofDay), true)).toBe(true);
     // Within one stored cost unit of the raw proof cost.
-    expect(recountProofProvesCost(cell(100, 0.10005), proofDay, submittedFor(proofDay))).toBe(true);
+    expect(recountProofProvesCost(cell(100, 0.10005), proofDay, submittedFor(proofDay), true)).toBe(true);
     // Another source's cell can hold the same counts at a different cost.
-    expect(recountProofProvesCost(cell(100, 0.15), proofDay, submittedFor(proofDay))).toBe(false);
-    expect(recountProofProvesCost(cell(200, 0.2), proofDay, submittedFor(proofDay))).toBe(false);
+    expect(recountProofProvesCost(cell(100, 0.15), proofDay, submittedFor(proofDay), true)).toBe(false);
+    expect(recountProofProvesCost(cell(200, 0.2), proofDay, submittedFor(proofDay), true)).toBe(false);
     // A model the proof does not name keeps the cell unproven.
     const twoModels = devinSnapshot(
       devinContribution("2026-10-08", 100, "swe-2-high", 0.1, 1),
       devinContribution("2026-10-08", 50, "swe-1-5", 0.05, 1)
     )["2026-10-08"];
-    expect(recountProofProvesCost(twoModels, proofDay, submittedFor(proofDay))).toBe(false);
+    expect(recountProofProvesCost(twoModels, proofDay, submittedFor(proofDay), true)).toBe(false);
   });
 
   it("reports what the transition's correction changed and whether it proves the cost", () => {
@@ -2142,7 +2148,11 @@ describe("devin-cli recount proof", () => {
     const correction = applyRecountProofToCell(stored, proofDay, zeroed, AT_TRANSITION);
     // The same on the incomplete day the submission actually marked.
     expect(
-      applyRecountProofToCell(stored, proofDay, zeroed, { ...AT_TRANSITION, costIsComplete: false }).cell.cost
+      applyRecountProofToCell(stored, proofDay, zeroed, {
+        ...AT_TRANSITION,
+        costIsComplete: false,
+        submissionCostIsComplete: false,
+      }).cell.cost
     ).toBeCloseTo(0.15, 4);
     expect(correction.changed).toBe(true);
     expect(correction.costProven).toBe(false);
@@ -2153,8 +2163,33 @@ describe("devin-cli recount proof", () => {
 
     // Nor does such a proof show a cost to be complete.
     const atCorrected = devinSnapshot(devinContribution("2026-10-08", 100, "swe-2-high", 0.1, 1))["2026-10-08"];
-    expect(recountProofProvesCost(atCorrected, proofDay, zeroed)).toBe(false);
-    expect(recountProofProvesCost(atCorrected, proofDay, submittedFor(proofDay))).toBe(true);
+    expect(recountProofProvesCost(atCorrected, proofDay, zeroed, true)).toBe(false);
+    expect(recountProofProvesCost(atCorrected, proofDay, submittedFor(proofDay), true)).toBe(true);
+  });
+
+  it("changes the cost of a model the snapshot did not submit only when the whole submission is complete", () => {
+    // Every stored row on the 8th is a duplicate of a survivor dated another
+    // day, so the snapshot submits nothing for the 8th and the corrected side
+    // is empty. The old CLI priced the rows at $0.15.
+    const proofDay = proof({
+      "2026-10-08": { previous: proofCell(100, 0.2, 1), corrected: proofCell(0, 0, 0) },
+    })["2026-10-08"];
+    const stored = devinSnapshot(devinContribution("2026-10-08", 100, "swe-2-high", 0.15, 1))["2026-10-08"];
+
+    // Another day of the submission could not be priced, so the survivors'
+    // price is unknown: the counts go, the cost stays.
+    const partial = applyRecountProofToCell(stored, proofDay, undefined, {
+      ...AT_TRANSITION,
+      submissionCostIsComplete: false,
+    });
+    expect(partial.cell.tokens).toBe(0);
+    expect(partial.cell.cost).toBeCloseTo(0.15, 4);
+    expect(partial.costProven).toBe(false);
+
+    // With every day priced, the duplicates' cost goes with them.
+    const complete = applyRecountProofToCell(stored, proofDay, undefined, AT_TRANSITION);
+    expect(complete.cell.tokens).toBe(0);
+    expect(complete.cell.cost).toBe(0);
   });
 
   it("keeps generation-1 submissions compatible before the transition", () => {
