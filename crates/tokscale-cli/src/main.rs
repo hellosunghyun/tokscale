@@ -385,6 +385,11 @@ enum Commands {
         #[command(subcommand)]
         subcommand: AmpSubcommand,
     },
+    #[command(about = "Separate experimental browser-mediated Grok Bot source snapshots")]
+    GrokBot {
+        #[command(subcommand)]
+        subcommand: commands::grok_bot_history::Command,
+    },
     #[command(about = "Cursor API cache integration commands")]
     Cursor {
         #[command(subcommand)]
@@ -694,7 +699,18 @@ fn validate_offline_command(command: Option<&Commands>) -> Result<()> {
 fn main() -> Result<()> {
     use std::io::IsTerminal;
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // This source is independent of scanner settings and must not pin/update
+    // their timezone or read account configuration merely to collect/view it.
+    if matches!(&cli.command, Some(Commands::GrokBot { .. })) {
+        if cli.test_data {
+            anyhow::bail!("grok_history_test_data_not_supported");
+        }
+        reject_unsupported_home_override(&cli.home, "grok-bot")?;
+        if let Some(Commands::GrokBot { subcommand }) = cli.command.take() {
+            return commands::grok_bot_history::run(subcommand, cli.offline);
+        }
+    }
     if cli.offline {
         validate_offline_command(cli.command.as_ref())?;
         tokscale_core::network::go_offline();
@@ -1004,6 +1020,10 @@ fn main() -> Result<()> {
             match subcommand {
                 AmpSubcommand::Sync { json, timeout } => amp::run_amp_sync(json, timeout),
             }
+        }
+        Some(Commands::GrokBot { subcommand }) => {
+            reject_unsupported_home_override(&cli.home, "grok-bot")?;
+            commands::grok_bot_history::run(subcommand, cli.offline)
         }
         Some(Commands::Cursor { subcommand }) => {
             reject_unsupported_home_override(&cli.home, "cursor")?;
