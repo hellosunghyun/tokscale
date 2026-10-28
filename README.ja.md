@@ -911,6 +911,8 @@ TUI では **Usage** タブに移動するとサブスクリプションデー�
 | **OpenCode Go** | API キー（`~/.local/share/opencode/auth.json` または環境変数） | Rolling、Weekly、Monthly クォータ | OpenCode で `/connect` を実行、または `OPENCODE_API_KEY` を設定 |
 | **Sakana**（Fugu） | セッションクッキー（環境変数またはファイル） — 課金コンソールの HTML スクレイプ、公開 API なし | 5時間、Weekly クォータウィンドウ（プランティアと月額料金をメタデータとして） | `SAKANA_SESSION_COOKIE` を設定（[docs/providers/sakana.md](docs/providers/sakana.md) を参照） |
 
+**実験的な Grok Bot ブラウザー履歴（macOS）:** `tokscale --no-spinner grok-bot sync --transport aside` はログイン済みのローカル Aside Browser と Python 3 を使い、所有者・期間ごとの独立したスナップショットを保存します。`tokscale --no-spinner grok-bot history` で参照できます。トークンレポート・送信・ランキングには含まれず、モデル・費用・保存範囲は未確認のままです。[ブラウザー履歴](docs/grok-bot-browser-history.md)を参照してください。
+
 プロバイダーは自動検出されます — 有効な資格情報を持つものだけが表示されます。プロバイダーが表示されない場合は、ログイン済みか、必要な環境変数が設定されているか確認してください。
 
 #### Codex マルチアカウント使用量

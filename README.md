@@ -923,6 +923,8 @@ In the TUI, navigate to the **Usage** tab to see subscription data. Use `[Refres
 | **OpenCode Go** | API key (`~/.local/share/opencode/auth.json` or env var) | Rolling, Weekly, Monthly quotas | Run `/connect` in OpenCode, or set `OPENCODE_API_KEY` |
 | **Sakana** (Fugu) | Session cookie (env var or file) — billing-console HTML scrape, no public API | 5-hour, Weekly quota windows (plan tier + monthly price as metadata) | Set `SAKANA_SESSION_COOKIE` (see [docs/providers/sakana.md](docs/providers/sakana.md)) |
 
+**Experimental Grok Bot browser history (macOS):** `tokscale --no-spinner grok-bot sync --transport aside` saves separate owner/range snapshots using an existing logged-in local Aside Browser and Python 3. Read them with `tokscale --no-spinner grok-bot history`. They are excluded from token reports, submissions and leaderboards; model/cost and retention stay unknown. See [browser history](docs/grok-bot-browser-history.md).
+
 Providers are auto-detected — only those with valid credentials are shown. If a provider is missing, ensure you've logged in or set the required environment variable.
 
 #### Codex Multi-Account Usage

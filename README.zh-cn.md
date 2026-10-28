@@ -910,6 +910,8 @@ tokscale usage --light
 | **OpenCode Go** | API 密钥（`~/.local/share/opencode/auth.json` 或环境变量） | Rolling、Weekly、Monthly 配额 | 在 OpenCode 中运行 `/connect`，或设置 `OPENCODE_API_KEY` |
 | **Sakana**（Fugu） | 会话 cookie（环境变量或文件）—— 计费控制台 HTML 抓取，无公开 API | 5 小时、Weekly 配额窗口（套餐等级 + 月度价格作为元数据） | 设置 `SAKANA_SESSION_COOKIE`（参见 [docs/providers/sakana.md](docs/providers/sakana.md)） |
 
+**实验性 Grok Bot 浏览器历史记录（macOS）：** `tokscale --no-spinner grok-bot sync --transport aside` 使用已登录的本地 Aside Browser 和 Python 3，按账号与时间范围保存独立快照。使用 `tokscale --no-spinner grok-bot history` 查看。数据不进入令牌报告、提交或排行榜；模型、费用和保留范围仍未知。参见[浏览器历史记录](docs/grok-bot-browser-history.md)。
+
 提供商会被自动检测——仅显示具有有效凭据的提供商。如果缺少某个提供商，请确认您已登录或设置了所需的环境变量。
 
 #### Codex 多账号使用量

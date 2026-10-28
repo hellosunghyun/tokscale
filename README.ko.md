@@ -908,6 +908,8 @@ TUI에서는 **Usage** 탭으로 이동해 구독 데이터를 확인하세요. 
 | **OpenCode Go** | API 키 (`~/.local/share/opencode/auth.json` 또는 환경 변수) | Rolling, Weekly, Monthly 할당량 | OpenCode에서 `/connect` 실행, 또는 `OPENCODE_API_KEY` 설정 |
 | **Sakana** (Fugu) | 세션 쿠키 (환경 변수 또는 파일) — 빌링 콘솔 HTML 스크레이프, 공개 API 없음 | 5시간, 주간 할당량 창 (플랜 티어 + 월 가격은 메타데이터) | `SAKANA_SESSION_COOKIE` 설정 ([docs/providers/sakana.md](docs/providers/sakana.md) 참조) |
 
+**실험적 Grok Bot 브라우저 이력(macOS):** `tokscale --no-spinner grok-bot sync --transport aside`는 로그인된 로컬 Aside Browser와 Python 3로 계정·기간별 별도 스냅샷을 저장합니다. `tokscale --no-spinner grok-bot history`로 읽을 수 있습니다. 토큰 보고서·제출·리더보드에는 포함하지 않으며 모델·비용·보존 범위는 미확인 상태로 유지합니다. [브라우저 이력 문서](docs/grok-bot-browser-history.md)를 참조하세요.
+
 프로바이더는 자동 감지됩니다 — 유효한 자격 증명이 있는 프로바이더만 표시됩니다. 프로바이더가 보이지 않으면 로그인했는지 또는 필요한 환경 변수를 설정했는지 확인하세요.
 
 #### Codex 다중 계정 사용량
